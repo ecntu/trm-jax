@@ -62,7 +62,7 @@ class TRM(nnx.Module):
             return y, z
 
         y, z = lax.fori_loop(0, n, refine_latent, (y, z))
-        y = self.net(x=jnp.zeros_like(y), y=y, z=z)  # refine output (y) once
+        y = self.net(x=jnp.zeros_like(x), y=y, z=z)  # refine output (y) once
         return y, z
 
     def __call__(self, *, x, y, z, n=6, T=3):  # deep recursion
@@ -163,6 +163,7 @@ class InitState(nnx.Module):
 
 def loss_fn(model, x, z, y, y_true, n=6, T=3, halt_loss_weight=0.5):
     (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T)
+    y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
 
     rec_loss = softmax_ce(
         logits=rearrange(y_hat, "b l c -> (b l) c"),
@@ -170,10 +171,7 @@ def loss_fn(model, x, z, y, y_true, n=6, T=3, halt_loss_weight=0.5):
     ).mean()
 
     halt_targets = (y_hat.argmax(axis=-1) == y_true).all(axis=-1, keepdims=True)
-    halt_loss = binary_ce(
-        logits=q_hat,
-        labels=halt_targets,
-    ).mean()
+    halt_loss = binary_ce(logits=q_hat, labels=halt_targets).mean()
 
     loss = rec_loss + halt_loss_weight * halt_loss
     return loss, (y, z)
@@ -433,6 +431,7 @@ if __name__ == "__main__":
         args.workdir, just_logging=jax.process_index() > 0
     )
     writer.write_hparams(vars(args))
+    writer.write_scalars(0, {"hparams/n_params": n_params})
 
     def _val_callback(step, t):
         solved_acc, cell_acc = evaluate(ema_model, val_loader, _eval_step)
