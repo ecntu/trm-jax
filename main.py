@@ -7,31 +7,30 @@
 #     "flax",
 #     "jax",
 #     "optax",
+#     "simple-parsing",
 # ]
 # ///
 import numpy as np
-
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.lax import stop_gradient as sg
 from flax import nnx
+from einops import rearrange, reduce
 
 import optax
 from optax import sigmoid_binary_cross_entropy as binary_ce
 from optax import softmax_cross_entropy_with_integer_labels as softmax_ce
 
-from einops import rearrange, reduce
-
+from dataclasses import dataclass
 from functools import partial
 from collections import deque
-import argparse
 import random
+from absl import logging
 
 from datasets import load_dataset, Dataset
 from clu import metric_writers, periodic_actions
-
-from absl import logging
+import simple_parsing
 
 logging.set_verbosity(logging.INFO)
 
@@ -160,8 +159,8 @@ class InitState(nnx.Module):
         return self.state
 
 
-def loss_fn(model, x, y, z, y_true, n=6, T=3, halt_loss_weight=0.5):
-    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T)
+def loss_fn(model, x, y, z, y_true, config):
+    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=config.n, T=config.T)
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
 
     rec_loss = softmax_ce(
@@ -172,12 +171,15 @@ def loss_fn(model, x, y, z, y_true, n=6, T=3, halt_loss_weight=0.5):
     should_halt = (y_hat.argmax(axis=-1) == y_true).all(axis=-1, keepdims=True)
     halt_loss = binary_ce(logits=q_hat, labels=should_halt).mean()
 
-    loss = rec_loss + halt_loss_weight * halt_loss
+    loss = rec_loss + config.halt_loss_weight * halt_loss
     return loss, (y, z)
 
 
-@nnx.jit(static_argnames=("grad_fn", "ema_beta", "N_supervision"))
-def train_step(grad_fn, model, ema_model, opt, batch, ema_beta, N_supervision, rngs):
+grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+
+
+@nnx.jit(static_argnames=("grad_fn", "config"))
+def train_step(grad_fn, model, ema_model, opt, batch, config, rngs):
     model.train()
 
     x_input, y_true = batch["inputs"], batch["labels"]
@@ -187,17 +189,19 @@ def train_step(grad_fn, model, ema_model, opt, batch, ema_beta, N_supervision, r
     def sup_step(carry, _):
         model, opt, y, z = carry
         (loss, (y, z)), grads = grad_fn(
-            model, x, y, z, y_true
+            model, x, y, z, y_true, config
         )  # TODO: as kwargs (remove partials)
         opt.update(model, grads)
         # IDEA -- stay on policy here
         return (model, opt, y, z), (loss, optax.global_norm(grads))
 
     (model, opt, y, z), (losses, norms) = jax.lax.scan(
-        sup_step, (model, opt, y, z), None, length=N_supervision
+        sup_step, (model, opt, y, z), None, length=config.N_supervision
     )
 
-    new_ema_model = optax.incremental_update(model, ema_model, step_size=1 - ema_beta)
+    new_ema_model = optax.incremental_update(
+        model, ema_model, step_size=1 - config.ema_beta
+    )
 
     return (
         model,
@@ -206,18 +210,20 @@ def train_step(grad_fn, model, ema_model, opt, batch, ema_beta, N_supervision, r
         {
             "train/loss": losses[-1],
             "train/first_loss": losses[0],
-            "train/halfway_loss": losses[N_supervision // 2],
+            "train/halfway_loss": losses[config.N_supervision // 2],
             "train/grad_norm": norms[-1],
         },
     )
 
 
-@nnx.jit(static_argnames=("n", "T", "N_supervision"))
-def eval_step(model, batch, n, T, N_supervision, rngs):
+@nnx.jit(static_argnames=("config"))
+def eval_step(model, batch, config, rngs):
     model.eval()
 
     x_input, y_true = batch["inputs"], batch["labels"]
-    y_hats = model.predict(x_input, N_supervision=N_supervision, n=n, T=T, rngs=rngs)
+    y_hats = model.predict(
+        x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
+    )
     y_hat = y_hats[-1]  # just final prediction -- IDEA: could ensemble, etc.
 
     preds = y_hat.argmax(axis=-1)
@@ -226,12 +232,11 @@ def eval_step(model, batch, n, T, N_supervision, rngs):
     return solved_acc, cell_acc
 
 
-def evaluate(model, data_iter, eval_step):
+def evaluate(model, data_iter, config, rngs):
     total_solved_acc, total_cell_acc = 0.0, 0.0
     total_samples = 0
     for batch in data_iter:
-        solved_acc, cell_acc = eval_step(model, batch)
-
+        solved_acc, cell_acc = eval_step(model, batch, config, rngs)
         bs = batch["inputs"].shape[0]
         total_solved_acc += solved_acc * bs
         total_cell_acc += cell_acc * bs
@@ -300,36 +305,36 @@ class Loader:
         return self.prefetch_to_device()
 
 
-def model_factory(args, param_dtype, compute_dtype, rngs):
+def model_factory(config, param_dtype, compute_dtype, rngs):
     Linear = partial(
         nnx.Linear, dtype=compute_dtype, param_dtype=param_dtype, rngs=rngs
     )
 
     init_state = partial(
         InitState,
-        args.init_state,
-        args.batch_size,
-        args.seq_len,
-        args.h_dim,
+        config.init_state,
+        config.batch_size,
+        config.seq_len,
+        config.h_dim,
         rngs=rngs,
     )
 
     model = TRM(
         net=Net(
-            args.seq_len,
-            args.h_dim,
-            expansion=args.mlp_factor,
-            n_layers=args.n_layers,
+            config.seq_len,
+            config.h_dim,
+            expansion=config.mlp_factor,
+            n_layers=config.n_layers,
             linear=Linear,
             rngs=rngs,
         ),
-        output_head=Linear(args.h_dim, args.vocab_size),
+        output_head=Linear(config.h_dim, config.vocab_size),
         Q_head=nnx.Sequential(
             partial(reduce, pattern="b l h -> b h", reduction="mean"),
-            Linear(args.h_dim, 1),
+            Linear(config.h_dim, 1),
         ),
         input_embedding=nnx.Embed(
-            args.vocab_size, args.h_dim, param_dtype=param_dtype, rngs=rngs
+            config.vocab_size, config.h_dim, param_dtype=param_dtype, rngs=rngs
         ),
         init_y=init_state(),
         init_z=init_state(),
@@ -338,77 +343,58 @@ def model_factory(args, param_dtype, compute_dtype, rngs):
     return model
 
 
+@dataclass(frozen=True)
+class Config:
+    dataset: str = "emiliocantuc/sudoku-extreme-1k-aug-1000"
+    seq_len: int = 81
+    vocab_size: int = 10
+
+    n_layers: int = 2
+    h_dim: int = 512
+    mlp_factor: int = 4
+    init_state: str = "random"
+
+    N_supervision: int = 16
+    n: int = 6
+    T: int = 3
+    halt_loss_weight: float = 0.5
+
+    batch_size: int = 768
+    lr: float = 1e-4
+    lr_warmup_steps: int = 2000 // 16
+    weight_decay: float = 1.0
+    ema_beta: float = 0.999**16
+    steps: int = None
+
+    half_precision: bool = False
+    val_every: int = 100
+    workdir: str = None
+    seed: int = None
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--n_layers", type=int, default=2)
-    parser.add_argument("--h_dim", type=int, default=512)
-    parser.add_argument("--mlp_factor", type=int, default=4)
-    parser.add_argument(
-        "--init_state", type=str, default="random", choices=["static", "random"]
-    )
-
-    parser.add_argument("--N_supervision", type=int, default=16)
-    parser.add_argument("--n", type=int, default=6)
-    parser.add_argument("--T", type=int, default=3)
-    parser.add_argument("--halt_loss_weight", type=float, default=0.5)
-
-    parser.add_argument("--batch_size", type=int, default=768)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lr_warmup_steps", type=int, default=2000 // 16)
-    parser.add_argument("--weight_decay", type=float, default=1.0)
-    parser.add_argument("--ema_beta", type=float, default=0.999**16)
-    parser.add_argument("--epochs", type=int, default=60_000 // 16)
-    parser.add_argument("--steps", type=int, default=None)
-
-    # parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--half_precision", action="store_true")
-    # parser.add_argument("--k_passes", type=int, default=1)
-    parser.add_argument("--val_every", type=int, default=100)
-    # parser.add_argument("--eval_only", action="store_true")
-    # parser.add_argument("--skip_eval", action="store_true")
-    # parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--workdir", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-
-    args = parser.parse_args()
-
-    args.seq_len, args.vocab_size = 81, 10
+    config = simple_parsing.parse(Config)
 
     tpu = jax.default_backend() == "tpu"
     param_dtype = jnp.float32
-    compute_dtype = jnp.bfloat16 if tpu and args.half_precision else jnp.float32
+    compute_dtype = jnp.bfloat16 if tpu and config.half_precision else jnp.float32
+    seed = config.seed or random.randint(0, 2**32 - 1)
+    rngs = nnx.Rngs(seed)
 
-    args.seed = args.seed or random.randint(0, 2**32 - 1)
-    rngs = nnx.Rngs(args.seed)
+    train_ds = load_dataset(config.dataset, split="train")
+    val_ds = load_dataset(config.dataset, split="test[:1024]")
+    test_ds = load_dataset(config.dataset, split="test")
 
-    ds_path = "emiliocantuc/sudoku-extreme-1k-aug-1000"
-    train_ds = load_dataset(ds_path, split="train")
-    val_ds = load_dataset(ds_path, split="test[:1024]")
-    test_ds = load_dataset(ds_path, split="test")
+    train_loader = Loader(train_ds, batch_size=config.batch_size, shuffle_seed=seed)
+    val_loader = Loader(val_ds, batch_size=config.batch_size, epochs=1)
+    test_loader = Loader(test_ds, batch_size=config.batch_size, epochs=1)
 
-    train_loader = Loader(
-        train_ds, batch_size=args.batch_size, epochs=args.epochs, shuffle_seed=args.seed
-    )
-    val_loader = Loader(val_ds, batch_size=args.batch_size, epochs=1)
-    test_loader = Loader(test_ds, batch_size=args.batch_size, epochs=1)
-
-    args.steps = args.steps or args.epochs * (len(train_ds) // args.batch_size)
-
-    grad_fn = nnx.value_and_grad(
-        partial(loss_fn, n=args.n, T=args.T, halt_loss_weight=args.halt_loss_weight),
-        has_aux=True,
-    )
-
-    _eval_step = partial(
-        eval_step, n=args.n, T=args.T, N_supervision=args.N_supervision, rngs=rngs
-    )
-
-    model = model_factory(args, param_dtype, compute_dtype, rngs)
+    model = model_factory(config, param_dtype, compute_dtype, rngs)
     n_params = sum(jax.tree.map(jnp.size, jax.tree.leaves(nnx.state(model, nnx.Param))))
     print(f"No. of parameters: {n_params}")
 
     lr_schedule = optax.warmup_constant_schedule(
-        init_value=0.0, peak_value=args.lr, warmup_steps=args.lr_warmup_steps
+        init_value=0.0, peak_value=config.lr, warmup_steps=config.lr_warmup_steps
     )
 
     opt = nnx.Optimizer(
@@ -417,7 +403,7 @@ if __name__ == "__main__":
             optax.clip_by_global_norm(1.0),
             optax.adamw(
                 learning_rate=lr_schedule,
-                weight_decay=args.weight_decay,
+                weight_decay=config.weight_decay,
                 b1=0.9,
                 b2=0.95,
             ),
@@ -429,37 +415,34 @@ if __name__ == "__main__":
 
     # logging
     writer = metric_writers.create_default_writer(
-        args.workdir, just_logging=jax.process_index() > 0
+        config.workdir, just_logging=jax.process_index() > 0
     )
-    writer.write_hparams(vars(args))
+    writer.write_hparams(vars(config))
     writer.write_scalars(0, {"hparams/n_params": n_params})
 
     def _val_callback(step, t):
-        solved_acc, cell_acc = evaluate(ema_model, val_loader, _eval_step)
+        solved_acc, cell_acc = evaluate(ema_model, val_loader, config, rngs)
         writer.write_scalars(
             step, {"eval/solved_acc": solved_acc, "eval/cell_acc": cell_acc}
         )
 
     hooks = [
-        periodic_actions.ReportProgress(num_train_steps=args.steps, writer=writer),
+        periodic_actions.ReportProgress(num_train_steps=config.steps, writer=writer),
         periodic_actions.PeriodicCallback(
-            every_steps=args.val_every, on_steps=[args.steps], callback_fn=_val_callback
+            every_steps=config.val_every,
+            on_steps=[config.steps],
+            callback_fn=_val_callback,
         ),
     ]
-    if args.workdir is not None and jax.process_index() == 0:
-        hooks.append(periodic_actions.Profile(num_profile_steps=5, logdir=args.workdir))
+    if config.workdir is not None and jax.process_index() == 0:
+        hooks.append(
+            periodic_actions.Profile(num_profile_steps=5, logdir=config.workdir)
+        )
 
     with metric_writers.ensure_flushes(writer):
         for step, batch in enumerate(train_loader, start=1):
             model, opt, ema_model, train_metrics = train_step(
-                grad_fn,
-                model,
-                ema_model,
-                opt,
-                batch,
-                args.ema_beta,
-                args.N_supervision,
-                rngs,
+                grad_fn, model, ema_model, opt, batch, config, rngs
             )
             train_metrics["train/lr"] = lr_schedule(step)
             writer.write_scalars(step, train_metrics)
@@ -467,7 +450,7 @@ if __name__ == "__main__":
             for h in hooks:
                 h(step)
 
-            if step >= args.steps:
+            if step >= config.steps:
                 break
 
     # TODO:
