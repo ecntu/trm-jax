@@ -7,7 +7,6 @@
 #     "flax",
 #     "jax",
 #     "optax",
-#     "tensorflow",
 # ]
 # ///
 import numpy as np
@@ -99,11 +98,11 @@ def _find_multiple(a, b):
 class SwiGLU(nnx.Module):
     """SwiGLU(x, W1, W2, W3) = W2(SiLU(W1x) * W3x)"""
 
-    def __init__(self, d_model, expansion, linear, rngs):
-        d_inter = _find_multiple(round(d_model * expansion * 2 / 3), 256)
-        self.W1 = linear(d_model, d_inter, use_bias=False, rngs=rngs)
-        self.W3 = linear(d_model, d_inter, use_bias=False, rngs=rngs)
-        self.W2 = linear(d_inter, d_model, use_bias=False, rngs=rngs)
+    def __init__(self, h_dim, expansion, linear, rngs):
+        inter_dim = _find_multiple(round(h_dim * expansion * 2 / 3), 256)
+        self.W1 = linear(h_dim, inter_dim, use_bias=False, rngs=rngs)
+        self.W3 = linear(h_dim, inter_dim, use_bias=False, rngs=rngs)
+        self.W2 = linear(inter_dim, h_dim, use_bias=False, rngs=rngs)
 
     def __call__(self, x):
         return self.W2(nnx.silu(self.W1(x)) * self.W3(x))
@@ -161,7 +160,7 @@ class InitState(nnx.Module):
         return self.state
 
 
-def loss_fn(model, x, z, y, y_true, n=6, T=3, halt_loss_weight=0.5):
+def loss_fn(model, x, y, z, y_true, n=6, T=3, halt_loss_weight=0.5):
     (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T)
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
 
@@ -170,8 +169,8 @@ def loss_fn(model, x, z, y, y_true, n=6, T=3, halt_loss_weight=0.5):
         labels=rearrange(y_true, "b l -> (b l)"),
     ).mean()
 
-    halt_targets = (y_hat.argmax(axis=-1) == y_true).all(axis=-1, keepdims=True)
-    halt_loss = binary_ce(logits=q_hat, labels=halt_targets).mean()
+    should_halt = (y_hat.argmax(axis=-1) == y_true).all(axis=-1, keepdims=True)
+    halt_loss = binary_ce(logits=q_hat, labels=should_halt).mean()
 
     loss = rec_loss + halt_loss_weight * halt_loss
     return loss, (y, z)
@@ -187,7 +186,9 @@ def train_step(grad_fn, model, ema_model, opt, batch, ema_beta, N_supervision, r
 
     def sup_step(carry, _):
         model, opt, y, z = carry
-        (loss, (y, z)), grads = grad_fn(model, x, z, y, y_true)
+        (loss, (y, z)), grads = grad_fn(
+            model, x, y, z, y_true
+        )  # TODO: as kwargs (remove partials)
         opt.update(model, grads)
         # IDEA -- stay on policy here
         return (model, opt, y, z), (loss, optax.global_norm(grads))
