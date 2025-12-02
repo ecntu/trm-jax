@@ -24,7 +24,7 @@ from optax import softmax_cross_entropy_with_integer_labels as softmax_ce
 
 from dataclasses import dataclass
 from functools import partial
-from collections import deque
+from collections import defaultdict, deque
 import random
 from absl import logging
 
@@ -172,14 +172,29 @@ def loss_fn(model, x, y, z, y_true, config):
     halt_loss = binary_ce(logits=q_hat, labels=should_halt).mean()
 
     loss = rec_loss + config.halt_loss_weight * halt_loss
-    return loss, (y, z)
+    return loss, (y, z, y_hat, q_hat)
 
 
 grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
 
-@nnx.jit(static_argnames=("grad_fn", "config"))
-def train_step(grad_fn, model, ema_model, opt, batch, config, rngs):
+def pred_metrics(y_hat, y_true, prefix):
+    N, *_ = y_true.shape
+    preds = y_hat.argmax(axis=-1)
+    cell_acc = (preds == y_true).mean(axis=(-1, -2))
+    solved_acc = (preds == y_true).all(axis=-1).mean(axis=-1)
+    return {
+        f"{prefix}/cell_acc": cell_acc[-1],
+        f"{prefix}/cell_acc_first_delta": cell_acc[-1] - cell_acc[0],
+        f"{prefix}/cell_acc_halfway_delta": cell_acc[-1] - cell_acc[N // 2],
+        f"{prefix}/solved_acc": solved_acc[-1],
+        f"{prefix}/solved_acc_first_delta": solved_acc[-1] - solved_acc[0],
+        f"{prefix}/solved_acc_halfway_delta": solved_acc[-1] - solved_acc[N // 2],
+    }
+
+
+@nnx.jit(static_argnames=("config"))
+def train_step(model, ema_model, opt, batch, config, rngs):
     model.train()
 
     x_input, y_true = batch["inputs"], batch["labels"]
@@ -188,17 +203,14 @@ def train_step(grad_fn, model, ema_model, opt, batch, config, rngs):
 
     def sup_step(carry, _):
         model, opt, y, z = carry
-        (loss, (y, z)), grads = grad_fn(
-            model, x, y, z, y_true, config
-        )  # TODO: as kwargs (remove partials)
+        (loss, (y, z, y_hat, q_hat)), grads = grad_fn(model, x, y, z, y_true, config)
         opt.update(model, grads)
         # IDEA -- stay on policy here
-        return (model, opt, y, z), (loss, optax.global_norm(grads))
+        return (model, opt, y, z), (loss, y_hat, q_hat, optax.global_norm(grads))
 
-    (model, opt, y, z), (losses, norms) = jax.lax.scan(
+    (model, opt, y, z), (losses, y_hats, q_hats, norms) = jax.lax.scan(
         sup_step, (model, opt, y, z), None, length=config.N_supervision
     )
-
     new_ema_model = optax.incremental_update(
         model, ema_model, step_size=1 - config.ema_beta
     )
@@ -209,9 +221,11 @@ def train_step(grad_fn, model, ema_model, opt, batch, config, rngs):
         new_ema_model,
         {
             "train/loss": losses[-1],
-            "train/first_loss": losses[0],
-            "train/halfway_loss": losses[config.N_supervision // 2],
+            "train/loss_first_delta": losses[-1] - losses[0],
+            "train/loss_halfway_delta": losses[-1] - losses[config.N_supervision // 2],
+            "train/loss_std": jnp.std(losses),
             "train/grad_norm": norms[-1],
+            **pred_metrics(y_hats, y_true, prefix="train"),
         },
     )
 
@@ -224,25 +238,23 @@ def eval_step(model, batch, config, rngs):
     y_hats = model.predict(
         x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
     )
-    y_hat = y_hats[-1]  # just final prediction -- IDEA: could ensemble, etc.
-
-    preds = y_hat.argmax(axis=-1)
-    solved_acc = (preds == y_true).all(axis=-1).mean()
-    cell_acc = (preds == y_true).mean()
-    return solved_acc, cell_acc
+    return {
+        **pred_metrics(y_hats, y_true, prefix="eval"),
+        "batch_size": x_input.shape[0],
+    }
 
 
-def evaluate(model, data_iter, config, rngs):
-    total_solved_acc, total_cell_acc = 0.0, 0.0
-    total_samples = 0
+def evaluate_epoch(model, data_iter, config, rngs):
+    totals = defaultdict(float)
+    total_weight = 0.0
+
     for batch in data_iter:
-        solved_acc, cell_acc = eval_step(model, batch, config, rngs)
-        bs = batch["inputs"].shape[0]
-        total_solved_acc += solved_acc * bs
-        total_cell_acc += cell_acc * bs
-        total_samples += bs
-
-    return total_solved_acc / total_samples, total_cell_acc / total_samples
+        metrics = eval_step(model, batch, config, rngs)
+        bs = float(metrics.pop("batch_size"))
+        for k, v in metrics.items():
+            totals[k] += v * bs
+        total_weight += bs
+    return {k: v / total_weight for k, v in totals.items()}
 
 
 class Loader:
@@ -421,10 +433,7 @@ if __name__ == "__main__":
     writer.write_scalars(0, {"hparams/n_params": n_params})
 
     def _val_callback(step, t):
-        solved_acc, cell_acc = evaluate(ema_model, val_loader, config, rngs)
-        writer.write_scalars(
-            step, {"eval/solved_acc": solved_acc, "eval/cell_acc": cell_acc}
-        )
+        writer.write_scalars(step, evaluate_epoch(ema_model, val_loader, config, rngs))
 
     hooks = [
         periodic_actions.ReportProgress(num_train_steps=config.steps, writer=writer),
@@ -442,7 +451,7 @@ if __name__ == "__main__":
     with metric_writers.ensure_flushes(writer):
         for step, batch in enumerate(train_loader, start=1):
             model, opt, ema_model, train_metrics = train_step(
-                grad_fn, model, ema_model, opt, batch, config, rngs
+                model, ema_model, opt, batch, config, rngs
             )
             train_metrics["train/lr"] = lr_schedule(step)
             writer.write_scalars(step, train_metrics)
