@@ -53,16 +53,19 @@ class TRM(nnx.Module):
 
     def __call__(self, *, x, y, z, n=6, T=3):  # deep recursion
         # run T steps; stop grads for steps < T-1
-        def body(i, carry):
+
+        # stop gradients for T-1 steps
+        def body(_, carry):
             y, z = carry
             y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
-            is_last = i == (T - 1)
-            y = lax.select(is_last, y, sg(y))
-            z = lax.select(is_last, z, sg(z))
             return y, z
 
-        y, z = lax.fori_loop(0, T, body, (y, z))
-        return (sg(y), sg(z)), self.output_head(y), self.Q_head(y)
+        y, z = lax.fori_loop(0, T - 1, body, (y, z))
+        y, z = sg(y), sg(z)
+
+        # final step with gradients
+        y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
+        return (y, z), self.output_head(y), self.Q_head(y)
 
     def predict(self, x_input, N_supervision=16, n=6, T=3, rngs=None):
         x = self.input_embedding(x_input)
