@@ -170,7 +170,7 @@ grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
 
 def pred_metrics(y_hat, y_true, prefix):
-    N, *_ = y_true.shape
+    N, *_ = y_hat.shape
     preds = y_hat.argmax(axis=-1)
     cell_acc = (preds == y_true).mean(axis=(-1, -2))
     solved_acc = (preds == y_true).all(axis=-1).mean(axis=-1)
@@ -300,7 +300,7 @@ class Config:
     N_supervision: int = 16
     n: int = 6
     T: int = 3
-    halt_loss_weight: float = 0.5
+    halt_loss_weight: float = 0.0
 
     batch_size: int = 768
     lr: float = 1e-4
@@ -310,7 +310,7 @@ class Config:
     steps: int = None
 
     half_precision: bool = False
-    val_every: int = 100
+    val_every: int = 250
     workdir: str = None
     seed: int = None
 
@@ -394,6 +394,5 @@ if __name__ == "__main__":
                 break
 
     # TODO:
-    # - add checkpointing
-    # - ignore grad of halted tokens
     # - run full experiments
+    # - add checkpointing?
