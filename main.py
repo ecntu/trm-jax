@@ -290,7 +290,11 @@ def model_factory(config, param_dtype, compute_dtype, rngs):
         init_z=InitState(config.init_state, config.h_dim, rngs=rngs),
     )
 
-    return model
+    decay_mask = nnx.state(model, nnx.Param).map(
+        lambda path, p: (p.ndim >= 2) and ("embedding" not in path)
+    )
+
+    return model, decay_mask
 
 
 def shard_batch(batch):
@@ -359,7 +363,7 @@ if __name__ == "__main__":
     mesh_ctx = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
 
     with mesh_ctx:
-        model = model_factory(config, param_dtype, compute_dtype, rngs)
+        model, decay_mask = model_factory(config, param_dtype, compute_dtype, rngs)
         n_params = sum(
             jax.tree.map(jnp.size, jax.tree.leaves(nnx.state(model, nnx.Param)))
         )
@@ -379,10 +383,7 @@ if __name__ == "__main__":
                     b2=0.95,
                     eps=1e-4 if config.half_precision else 1e-8,
                     weight_decay=config.weight_decay,
-                    # don't apply weight decay to biases or norm params
-                    # mask=lambda params: jax.tree.map(
-                    #     lambda p: getattr(p, "ndim", 0) > 1, params
-                    # ),
+                    mask=decay_mask,
                 ),
             ),
             wrt=nnx.Param,
