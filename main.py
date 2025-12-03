@@ -22,6 +22,8 @@ from utils import Loader
 
 logging.set_verbosity(logging.INFO)
 
+jax.config.update("jax_debug_nans", True)
+
 
 class TRM(nnx.Module):
     def __init__(
@@ -69,7 +71,11 @@ class TRM(nnx.Module):
 
     def predict(self, x_input, N_supervision=16, n=6, T=3, rngs=None):
         x = self.input_embedding(x_input)
-        y, z = self.init_y(rngs), self.init_z(rngs)
+        batch_size, seq_len, _ = x.shape
+        y, z = (
+            self.init_y(batch_size, seq_len, rngs),
+            self.init_z(batch_size, seq_len, rngs),
+        )
 
         def supervision_step(carry, _):
             y, z = carry
@@ -135,19 +141,22 @@ def Net(seq_len, h_dim, expansion, n_layers, linear, rngs):
     )
 
 
+# TODO flax.nnx.initializers.truncated_normal?
 class InitState(nnx.Module):
-    def __init__(self, mode, batch_size, seq_len, h_dim, rngs):
+    def __init__(self, mode, h_dim, rngs):
         self.scale = jnp.sqrt(1 / h_dim)  # match input emb scale
-        self.gen_state = partial(jax.random.normal, shape=(batch_size, seq_len, h_dim))
+        self.gen_state = partial(jax.random.normal, shape=(1, 1, h_dim))
         if mode == "static":
             self.state = self.gen_state(rngs.next()) * self.scale
         else:
             self.state = None
 
-    def __call__(self, rngs=None):
+    def __call__(self, batch_size, seq_len, rngs=None):
         if self.state is None:
-            return self.gen_state(rngs.next()) * self.scale
-        return self.state
+            base = self.gen_state(rngs.next()) * self.scale
+        else:
+            base = self.state
+        return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
 
 
 def loss_fn(model, x, y, z, y_true, config):
@@ -190,7 +199,10 @@ def train_step(model, ema_model, opt, batch, config, rngs):
 
     x_input, y_true = batch["inputs"], batch["labels"]
     x = model.input_embedding(x_input)
-    y, z = model.init_y(rngs), model.init_z(rngs)
+    y, z = (
+        model.init_y(config.batch_size, config.seq_len, rngs),
+        model.init_z(config.batch_size, config.seq_len, rngs),
+    )
 
     def sup_step(carry, _):
         model, opt, y, z = carry
@@ -253,15 +265,6 @@ def model_factory(config, param_dtype, compute_dtype, rngs):
         nnx.Linear, dtype=compute_dtype, param_dtype=param_dtype, rngs=rngs
     )
 
-    init_state = partial(
-        InitState,
-        config.init_state,
-        config.batch_size,
-        config.seq_len,
-        config.h_dim,
-        rngs=rngs,
-    )
-
     model = TRM(
         net=Net(
             config.seq_len,
@@ -279,8 +282,8 @@ def model_factory(config, param_dtype, compute_dtype, rngs):
         input_embedding=nnx.Embed(
             config.vocab_size, config.h_dim, param_dtype=param_dtype, rngs=rngs
         ),
-        init_y=init_state(),
-        init_z=init_state(),
+        init_y=InitState(config.init_state, config.h_dim, rngs=rngs),
+        init_z=InitState(config.init_state, config.h_dim, rngs=rngs),
     )
 
     return model
@@ -325,6 +328,7 @@ if __name__ == "__main__":
     rngs = nnx.Rngs(seed)
 
     train_ds = load_dataset(config.dataset, split="train")
+    # train_ds = load_dataset(config.dataset, split=f"train[:{config.batch_size}]") # debug by overfitting to single batch
     val_ds = load_dataset(config.dataset, split="test[:1024]")
     test_ds = load_dataset(config.dataset, split="test")
 
@@ -346,9 +350,14 @@ if __name__ == "__main__":
             optax.clip_by_global_norm(1.0),
             optax.adamw(
                 learning_rate=lr_schedule,
-                weight_decay=config.weight_decay,
                 b1=0.9,
                 b2=0.95,
+                eps=1e-4 if config.half_precision else 1e-8,
+                weight_decay=config.weight_decay,
+                # don't apply weight decay to biases or norm params
+                # mask=lambda params: jax.tree.map(
+                #     lambda p: getattr(p, "ndim", 0) > 1, params
+                # ),
             ),
         ),
         wrt=nnx.Param,
