@@ -1,6 +1,7 @@
 # Custom
 logs/
 *.sh
+*.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
