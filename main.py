@@ -96,11 +96,11 @@ def _find_multiple(a, b):
 class SwiGLU(nnx.Module):
     """SwiGLU(x, W1, W2, W3) = W2(SiLU(W1x) * W3x)"""
 
-    def __init__(self, h_dim, expansion, linear, rngs):
+    def __init__(self, h_dim, expansion, linear):
         inter_dim = _find_multiple(round(h_dim * expansion * 2 / 3), 256)
-        self.W1 = linear(h_dim, inter_dim, use_bias=False, rngs=rngs)
-        self.W3 = linear(h_dim, inter_dim, use_bias=False, rngs=rngs)
-        self.W2 = linear(inter_dim, h_dim, use_bias=False, rngs=rngs)
+        self.W1 = linear(h_dim, inter_dim, use_bias=False)
+        self.W3 = linear(h_dim, inter_dim, use_bias=False)
+        self.W2 = linear(inter_dim, h_dim, use_bias=False)
 
     def __call__(self, x):
         return self.W2(nnx.silu(self.W1(x)) * self.W3(x))
@@ -108,8 +108,8 @@ class SwiGLU(nnx.Module):
 
 class MixerBlock(nnx.Module):
     def __init__(self, seq_len, h_dim, expansion, linear, rngs):
-        self.l_mixer = SwiGLU(seq_len, expansion, linear, rngs=rngs)
-        self.d_mixer = SwiGLU(h_dim, expansion, linear, rngs=rngs)
+        self.l_mixer = SwiGLU(seq_len, expansion, linear)
+        self.d_mixer = SwiGLU(h_dim, expansion, linear)
         self.l_norm = nnx.RMSNorm(h_dim, use_scale=True, rngs=rngs, dtype=jnp.float32)
         self.d_norm = nnx.RMSNorm(h_dim, use_scale=True, rngs=rngs, dtype=jnp.float32)
 
@@ -326,7 +326,7 @@ class Config:
     lr_warmup_steps: int = 2000 // 16
     weight_decay: float = 1.0
     ema_beta: float = 0.999**16
-    steps: int = None
+    steps: int = 25_000
 
     half_precision: bool = False
     val_every: int = 250
