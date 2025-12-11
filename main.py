@@ -207,14 +207,18 @@ def train_step(model, ema_model, opt, batch, config, rngs):
     )
 
     def sup_step(carry, _):
-        model, opt, y, z = carry
+        model, opt, y, z, rngs = carry
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(model, x, y, z, y_true, config)
         opt.update(model, grads)
         # IDEA -- stay on policy here
-        return (model, opt, y, z), (loss, y_hat, q_hat, optax.global_norm(grads))
+        corr_std = jax.random.uniform(rngs()) * config.max_corruption_std
+        y = y + jax.random.normal(rngs(), y.shape) * y.std() * corr_std
+        z = z + jax.random.normal(rngs(), z.shape) * z.std() * corr_std
 
-    (model, opt, y, z), (losses, y_hats, q_hats, norms) = jax.lax.scan(
-        sup_step, (model, opt, y, z), None, length=config.N_supervision
+        return (model, opt, y, z, rngs), (loss, y_hat, q_hat, optax.global_norm(grads))
+
+    (model, opt, y, z, _), (losses, y_hats, q_hats, norms) = jax.lax.scan(
+        sup_step, (model, opt, y, z, rngs), None, length=config.N_supervision
     )
     new_ema_model = optax.incremental_update(
         model, ema_model, step_size=1 - config.ema_beta
@@ -320,6 +324,7 @@ class Config:
     n: int = 6
     T: int = 3
     halt_loss_weight: float = 0.0
+    max_corruption_std: float = 0.05
 
     batch_size: int = 768
     lr: float = 1e-4
