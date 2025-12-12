@@ -161,17 +161,30 @@ class InitState(nnx.Module):
         return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
 
 
-def loss_fn(model, x, y, z, y_true, config):
+def loss_fn(model, x, y, z, y_true, alive, config):
     (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=config.n, T=config.T)
-    y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
 
-    rec_loss = softmax_ce(
-        logits=rearrange(y_hat, "b l c -> (b l) c"),
-        labels=rearrange(y_true, "b l -> (b l)"),
-    ).mean()
+    y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
+    alive = alive.astype(jnp.float32)
+    total_alive = alive.sum().clip(min=1.0)
+    bs, seq_len, _ = x.shape
+
+    rec_loss = (
+        rearrange(
+            softmax_ce(
+                logits=rearrange(y_hat, "b l c -> (b l) c"),
+                labels=rearrange(y_true, "b l -> (b l)"),
+            ),
+            "(b l) -> b l",
+            b=bs,
+        )
+        * alive
+    ).sum() / (total_alive * seq_len)
 
     should_halt = (y_hat.argmax(axis=-1) == y_true).all(axis=-1, keepdims=True)
-    halt_loss = binary_ce(logits=q_hat, labels=should_halt).mean()
+    halt_loss = (
+        rearrange(binary_ce(logits=q_hat, labels=should_halt), "b 1 -> b 1") * alive
+    ).sum() / total_alive
 
     loss = rec_loss + config.halt_loss_weight * halt_loss
     return loss, (y, z, y_hat, q_hat)
@@ -201,24 +214,52 @@ def train_step(model, ema_model, opt, batch, config, rngs):
 
     x_input, y_true = batch["inputs"], batch["labels"]
     x = model.input_embedding(x_input)
+    bs, seq_len, _ = x.shape
+
     y, z = (
-        model.init_y(config.batch_size, config.seq_len, rngs),
-        model.init_z(config.batch_size, config.seq_len, rngs),
+        model.init_y(bs, seq_len, rngs),
+        model.init_z(bs, seq_len, rngs),
     )
 
+    min_steps = (
+        jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
+    ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
+
     def sup_step(carry, _):
-        model, opt, y, z, rngs = carry
-        (loss, (y, z, y_hat, q_hat)), grads = grad_fn(model, x, y, z, y_true, config)
+        step, model, opt, y, z, alive, rngs = carry
+
+        # update step
+        (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
+            model, x, y, z, y_true, alive, config
+        )
         opt.update(model, grads)
-        # IDEA -- stay on policy here
+
+        # TODO IDEA -- stay on policy here
+
+        # add noise to latents (new) # TODO per example std?
         corr_std = jax.random.uniform(rngs()) * config.max_corruption_std
         y = y + jax.random.normal(rngs(), y.shape) * y.std() * corr_std
         z = z + jax.random.normal(rngs(), z.shape) * z.std() * corr_std
 
-        return (model, opt, y, z, rngs), (loss, y_hat, q_hat, optax.global_norm(grads))
+        keep_alive = q_hat < 0.0  # TODO threshold as hparam?
+        alive = alive & (keep_alive | (step < min_steps))
 
-    (model, opt, y, z, _), (losses, y_hats, q_hats, norms) = jax.lax.scan(
-        sup_step, (model, opt, y, z, rngs), None, length=config.N_supervision
+        return (step + 1, model, opt, y, z, alive, rngs), (
+            loss,
+            y_hat,
+            q_hat,
+            optax.global_norm(grads),
+            alive.mean(),
+        )
+
+    alive = jnp.ones((bs, 1), dtype=jnp.bool_)
+    (_, model, opt, y, z, alive, _), (losses, y_hats, q_hats, norms, props_alive) = (
+        jax.lax.scan(
+            sup_step,
+            (1, model, opt, y, z, alive, rngs),
+            None,
+            length=config.N_supervision,
+        )
     )
     new_ema_model = optax.incremental_update(
         model, ema_model, step_size=1 - config.ema_beta
@@ -233,6 +274,10 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             "train/loss_first_delta": losses[-1] - losses[0],
             "train/loss_halfway_delta": losses[-1] - losses[config.N_supervision // 2],
             "train/loss_std": jnp.std(losses),
+            "train/prop_alive": props_alive[-1],
+            "train/prop_alive_first_delta": props_alive[-1] - props_alive[0],
+            "train/prop_alive_halfway_delta": props_alive[-1]
+            - props_alive[config.N_supervision // 2],
             "train/grad_norm": norms[-1],
             **pred_metrics(y_hats, y_true, prefix="train"),
         },
@@ -323,7 +368,8 @@ class Config:
     N_supervision: int = 16
     n: int = 6
     T: int = 3
-    halt_loss_weight: float = 0.0
+    halt_loss_weight: float = 0.5
+    halt_exploration_prob: float = 0.1
     max_corruption_std: float = 0.0
 
     batch_size: int = 768
