@@ -1,16 +1,28 @@
-# trm-jax
+A simple JAX reproduction of the [Tiny Recursion Model](https://arxiv.org/abs/2510.04871) (TRM) trained on the sudoku-extreme task. Attempting to match the paper's results and then perform a few experiments. See the official PyTorch implementation [here](https://github.com/SamsungSAILMontreal/TinyRecursiveModels).
 
-Working small model run:
+Thanks to the [TPU Research Cloud](https://sites.research.google/trc/about/) program for the compute!
+
+Run with: 
 
 ```bash
-uv run --with jax\[tpu\] main.py \
---batch_size 128 --h_dim 256  --weight_decay 1e-3 --lr 1e-3 \
---steps 25_000 --init_state static --half_precision
+uv run --with jax\[tpu\] main.py --workdir logs/run_name
 ```
+### Todo
+- [ ] Add halt masking
+- [ ] Match paper performance (>85% solve rate)
+- [ ] Fix random seed determinism
+- [ ] Add checkpointing
 
-Trying big run in a v4-8 with:
-```bash
-uv run --with jax\[tpu\] main.py \
---batch_size 768 --h_dim 512 --weight_decay 1.0 --lr 1e-4 \
---N_supervision 8 --steps 25_000 --init_state static
+### Citations
+
+```bibtex
+@misc{jolicoeurmartineau2025morerecursivereasoningtiny,
+      title={Less is More: Recursive Reasoning with Tiny Networks}, 
+      author={Alexia Jolicoeur-Martineau},
+      year={2025},
+      eprint={2510.04871},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2510.04871}, 
+}
 ```

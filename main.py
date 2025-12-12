@@ -318,13 +318,13 @@ class Config:
     n_layers: int = 2
     h_dim: int = 512
     mlp_factor: int = 4
-    init_state: str = "random"
+    init_state: str = "static"
 
     N_supervision: int = 16
     n: int = 6
     T: int = 3
     halt_loss_weight: float = 0.0
-    max_corruption_std: float = 0.05
+    max_corruption_std: float = 0.0
 
     batch_size: int = 768
     lr: float = 1e-4
@@ -438,7 +438,3 @@ if __name__ == "__main__":
 
                 if step >= config.steps:
                     break
-
-        # TODO:
-        # - run full experiments
-        # - add checkpointing?
