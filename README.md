@@ -8,7 +8,6 @@ Run with:
 uv run --with jax\[tpu\] main.py --workdir logs/run_name
 ```
 ### Todo
-- [ ] Add halt masking
 - [ ] Match paper performance (>85% solve rate)
 - [ ] Fix random seed determinism
 - [ ] Add checkpointing
