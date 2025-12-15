@@ -275,9 +275,8 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             "train/loss_halfway_delta": losses[-1] - losses[config.N_supervision // 2],
             "train/loss_std": jnp.std(losses),
             "train/prop_alive": props_alive[-1],
-            "train/prop_alive_first_delta": props_alive[-1] - props_alive[0],
-            "train/prop_alive_halfway_delta": props_alive[-1]
-            - props_alive[config.N_supervision // 2],
+            "train/prop_alive_first": props_alive[0],
+            "train/prop_alive_halfway": props_alive[config.N_supervision // 2],
             "train/grad_norm": norms[-1],
             "train/logit_mean": jnp.abs(y_hats[-1]).mean(),
             "train/logit_std": jnp.std(y_hats[-1]),
