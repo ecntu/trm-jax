@@ -4,12 +4,14 @@ from jax import lax
 from jax.lax import stop_gradient as sg
 from jax.sharding import PartitionSpec as P
 from flax import nnx
+import orbax.checkpoint as ocp
 from einops import rearrange, reduce
 
 import optax
 from optax import sigmoid_binary_cross_entropy as binary_ce
 from optax import softmax_cross_entropy_with_integer_labels as softmax_ce
 
+import os
 import random
 import contextlib
 from dataclasses import dataclass
@@ -20,7 +22,7 @@ from clu import metric_writers, periodic_actions
 import simple_parsing
 
 from datasets import load_dataset
-from utils import Loader
+from utils import Loader, restore_checkpoint, save_checkpoint
 
 logging.set_verbosity(logging.INFO)
 
@@ -385,6 +387,8 @@ class Config:
     val_every: int = 250
     workdir: str = None
     seed: int = None
+    checkpoint_every: int = 250
+    max_checkpoints: int = 3
 
 
 if __name__ == "__main__":
@@ -444,6 +448,18 @@ if __name__ == "__main__":
 
         ema_model = nnx.clone(model)
 
+        checkpoint_manager = None
+        if config.workdir is not None:
+            checkpoint_manager = ocp.CheckpointManager(
+                os.path.abspath(config.workdir),
+                ocp.PyTreeCheckpointer(),
+                options=ocp.CheckpointManagerOptions(
+                    best_mode="max",
+                    best_fn=lambda m: m,
+                    max_to_keep=config.max_checkpoints,
+                ),
+            )
+
         # logging
         writer = metric_writers.create_default_writer(
             config.workdir, just_logging=jax.process_index() > 0
@@ -451,9 +467,17 @@ if __name__ == "__main__":
         writer.write_hparams(vars(config))
         writer.write_scalars(0, {"hparams/n_params": n_params})
 
+        start_step = restore_checkpoint(checkpoint_manager, model, opt, ema_model)
+        checkpoint_by = {"metric": None}
+
         def _val_callback(step, t):
-            writer.write_scalars(
-                step, evaluate_epoch(ema_model, val_loader, config, rngs, mesh)
+            m = evaluate_epoch(ema_model, val_loader, config, rngs, mesh)
+            checkpoint_by["metric"] = float(m["eval/solved_acc"])
+            writer.write_scalars(step, m)
+
+        def _checkpoint_callback(step, t):
+            save_checkpoint(
+                checkpoint_manager, step, model, opt, ema_model, checkpoint_by["metric"]
             )
 
         hooks = [
@@ -465,14 +489,25 @@ if __name__ == "__main__":
                 on_steps=[config.steps],
                 callback_fn=_val_callback,
             ),
+            periodic_actions.PeriodicCallback(
+                every_steps=config.checkpoint_every,
+                on_steps=[config.steps],
+                callback_fn=_checkpoint_callback,
+            ),
         ]
         if config.workdir is not None and jax.process_index() == 0:
             hooks.append(
                 periodic_actions.Profile(num_profile_steps=5, logdir=config.workdir)
             )
 
+        if start_step > config.steps:
+            logging.info(
+                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); exiting."
+            )
+            exit(0)
+
         with metric_writers.ensure_flushes(writer):
-            for step, batch in enumerate(train_loader, start=1):
+            for step, batch in enumerate(train_loader, start=start_step):
                 if mesh is not None:
                     batch = shard_batch(batch)
                 model, opt, ema_model, train_metrics = train_step(

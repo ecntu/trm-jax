@@ -2,6 +2,8 @@ import numpy as np
 import jax
 from collections import deque
 from datasets import Dataset
+from flax import nnx
+from absl import logging
 
 
 class Loader:
@@ -62,3 +64,32 @@ class Loader:
 
     def __iter__(self):
         return self.prefetch_to_device()
+
+
+def checkpoint_targets(model, opt, ema_model):
+    return {
+        "model": nnx.state(model),
+        "opt": nnx.state(opt),
+        "ema_model": nnx.state(ema_model),
+    }
+
+
+def restore_checkpoint(manager, model, opt, ema_model):
+    if manager is None or manager.latest_step() is None:
+        return 1
+
+    latest_step = manager.latest_step()
+    restored = manager.restore(
+        latest_step, items=checkpoint_targets(model, opt, ema_model)
+    )
+    nnx.update(model, restored["model"])
+    nnx.update(opt, restored["opt"])
+    nnx.update(ema_model, restored["ema_model"])
+    logging.info(f"Restored checkpoint at step {latest_step}")
+    return int(latest_step) + 1
+
+
+def save_checkpoint(manager, step, model, opt, ema_model, metrics=None):
+    if manager is None or jax.process_index() != 0:
+        return
+    manager.save(step, checkpoint_targets(model, opt, ema_model), metrics=metrics)
