@@ -26,8 +26,6 @@ from utils import Loader, restore_checkpoint, save_checkpoint
 
 logging.set_verbosity(logging.INFO)
 
-jax.config.update("jax_debug_nans", True)
-
 
 class TRM(nnx.Module):
     def __init__(
@@ -112,8 +110,8 @@ class MixerBlock(nnx.Module):
     def __init__(self, seq_len, h_dim, expansion, linear, rngs):
         self.l_mixer = SwiGLU(seq_len, expansion, linear)
         self.d_mixer = SwiGLU(h_dim, expansion, linear)
-        self.l_norm = nnx.RMSNorm(h_dim, use_scale=True, rngs=rngs, dtype=jnp.float32)
-        self.d_norm = nnx.RMSNorm(h_dim, use_scale=True, rngs=rngs, dtype=jnp.float32)
+        self.l_norm = nnx.RMSNorm(h_dim, use_scale=False, rngs=rngs, dtype=jnp.float32)
+        self.d_norm = nnx.RMSNorm(h_dim, use_scale=False, rngs=rngs, dtype=jnp.float32)
 
     def __call__(self, h):
         o = self.l_norm(h)
@@ -128,21 +126,28 @@ class MixerBlock(nnx.Module):
         return o + h
 
 
-def Net(seq_len, h_dim, expansion, n_layers, linear, rngs):
-    return nnx.Sequential(
-        lambda x, y, z: x + y + z,
-        *[
-            MixerBlock(
-                seq_len=seq_len,
-                h_dim=h_dim,
-                expansion=expansion,
-                linear=linear,
-                rngs=rngs,
-            )
-            for _ in range(n_layers)
-        ],
-        nnx.RMSNorm(h_dim, use_scale=True, rngs=rngs, dtype=jnp.float32),
-    )
+class Net(nnx.Module):
+    def __init__(self, seq_len, h_dim, expansion, n_layers, linear, rngs):
+        # normalize x, y, z separately before adding
+        norm = partial(nnx.RMSNorm, num_features=h_dim, dtype=jnp.float32, rngs=rngs)
+        self.x_norm, self.y_norm, self.z_norm = (norm(), norm(), norm())
+
+        self.net = nnx.Sequential(
+            *[
+                MixerBlock(
+                    seq_len=seq_len,
+                    h_dim=h_dim,
+                    expansion=expansion,
+                    linear=linear,
+                    rngs=rngs,
+                )
+                for _ in range(n_layers)
+            ],
+            norm(rngs=rngs),
+        )
+
+    def __call__(self, *, x, y, z):
+        return self.net(self.x_norm(x) + self.y_norm(y) + self.z_norm(z))
 
 
 # TODO flax.nnx.initializers.truncated_normal?
@@ -283,6 +288,9 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             "train/logit_mean": jnp.abs(y_hats[-1]).mean(),
             "train/logit_std": jnp.std(y_hats[-1]),
             "train/logit_max": jnp.max(y_hats[-1]),
+            "train/x_prenorm_scale": model.net.x_norm.scale.mean(),
+            "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
+            "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
             **pred_metrics(y_hats, y_true, prefix="train"),
         },
     )
