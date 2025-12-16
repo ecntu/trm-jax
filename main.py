@@ -16,7 +16,7 @@ import random
 import contextlib
 from dataclasses import dataclass
 from functools import partial
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from absl import logging
 from clu import metric_writers, periodic_actions
 import simple_parsing
@@ -143,7 +143,7 @@ class Net(nnx.Module):
                 )
                 for _ in range(n_layers)
             ],
-            norm(rngs=rngs),
+            norm(),
         )
 
     def __call__(self, *, x, y, z):
@@ -168,30 +168,18 @@ class InitState(nnx.Module):
         return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
 
 
-def loss_fn(model, x, y, z, y_true, alive, config):
+def loss_fn(model, x, y, z, y_true, config):
     (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=config.n, T=config.T)
 
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
-    alive = alive.astype(jnp.float32)
-    total_alive = alive.sum().clip(min=1.0)
-    bs, seq_len, _ = x.shape
 
-    rec_loss = (
-        rearrange(
-            softmax_ce(
-                logits=rearrange(y_hat, "b l c -> (b l) c"),
-                labels=rearrange(y_true, "b l -> (b l)"),
-            ),
-            "(b l) -> b l",
-            b=bs,
-        )
-        * alive
-    ).sum() / (total_alive * seq_len)
+    rec_loss = softmax_ce(
+        logits=rearrange(y_hat, "b l c -> (b l) c"),
+        labels=rearrange(y_true, "b l -> (b l)"),
+    ).mean()
 
     should_halt = (y_hat.argmax(axis=-1) == y_true).all(axis=-1, keepdims=True)
-    halt_loss = (
-        rearrange(binary_ce(logits=q_hat, labels=should_halt), "b 1 -> b 1") * alive
-    ).sum() / total_alive
+    halt_loss = binary_ce(logits=q_hat, labels=should_halt).mean()
 
     loss = rec_loss + config.halt_loss_weight * halt_loss
     return loss, (y, z, y_hat, q_hat)
@@ -215,85 +203,80 @@ def pred_metrics(y_hat, y_true, prefix):
     }
 
 
+TrainBatchCarry = namedtuple(
+    "TrainBatchCarry", ["step", "x_input", "y_true", "y", "z", "alive"]
+)
+
+
 @nnx.jit(static_argnames=("config"))
-def train_step(model, ema_model, opt, batch, config, rngs):
+def train_step(carry, model, ema_model, opt, batch, config, rngs):
     model.train()
 
-    x_input, y_true = batch["inputs"], batch["labels"]
-    x = model.input_embedding(x_input)
-    bs, seq_len, _ = x.shape
+    bs, seq_len = carry.x_input.shape
 
-    y, z = (
+    # replace halted examples with fresh ones from batch
+    x_input = jnp.where(carry.alive, carry.x_input, batch["inputs"])
+    y_true = jnp.where(carry.alive, carry.y_true, batch["labels"])
+
+    # zero steps for halted examples
+    step = carry.step * carry.alive.astype(jnp.int32)
+
+    # replace halted latents with init states
+    y_init, z_init = (
         model.init_y(bs, seq_len, rngs),
         model.init_z(bs, seq_len, rngs),
     )
 
-    min_steps = (
-        jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
-    ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
+    y = jnp.where(rearrange(carry.alive, "b 1 -> b 1 1"), carry.y, y_init)
+    z = jnp.where(rearrange(carry.alive, "b 1 -> b 1 1"), carry.z, z_init)
+    x = model.input_embedding(x_input)
 
-    def sup_step(carry, _):
-        step, model, opt, y, z, alive, rngs = carry
-
-        # update step
-        (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y, z, y_true, alive, config
-        )
-        opt.update(model, grads)
-
-        # TODO IDEA -- stay on policy here
-
-        # add noise to latents (new) # TODO per example std?
-        corr_std = jax.random.uniform(rngs()) * config.max_corruption_std
-        y = y + jax.random.normal(rngs(), y.shape) * y.std() * corr_std
-        z = z + jax.random.normal(rngs(), z.shape) * z.std() * corr_std
-
-        keep_alive = q_hat < 0.0  # TODO threshold as hparam?
-        alive = alive & (keep_alive | (step < min_steps))
-
-        return (step + 1, model, opt, y, z, alive, rngs), (
-            loss,
-            y_hat,
-            q_hat,
-            optax.global_norm(grads),
-            alive.mean(),
-        )
-
-    alive = jnp.ones((bs, 1), dtype=jnp.bool_)
-    (_, model, opt, y, z, alive, _), (losses, y_hats, q_hats, norms, props_alive) = (
-        jax.lax.scan(
-            sup_step,
-            (1, model, opt, y, z, alive, rngs),
-            None,
-            length=config.N_supervision,
-        )
-    )
+    # update step
+    (loss, (y, z, y_hat, q_hat)), grads = grad_fn(model, x, y, z, y_true, config)
+    opt.update(model, grads)
     new_ema_model = optax.incremental_update(
         model, ema_model, step_size=1 - config.ema_beta
     )
 
-    return (
-        model,
-        opt,
-        new_ema_model,
-        {
-            "train/loss": losses[-1],
-            "train/loss_first_delta": losses[-1] - losses[0],
-            "train/loss_halfway_delta": losses[-1] - losses[config.N_supervision // 2],
-            "train/loss_std": jnp.std(losses),
-            "train/prop_alive": props_alive[-1],
-            "train/prop_alive_first": props_alive[0],
-            "train/prop_alive_halfway": props_alive[config.N_supervision // 2],
-            "train/grad_norm": norms[-1],
-            "train/logit_mean": jnp.abs(y_hats[-1]).mean(),
-            "train/logit_std": jnp.std(y_hats[-1]),
-            "train/logit_max": jnp.max(y_hats[-1]),
-            "train/x_prenorm_scale": model.net.x_norm.scale.mean(),
-            "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
-            "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
-            **pred_metrics(y_hats, y_true, prefix="train"),
-        },
+    # TODO IDEA -- stay on policy here
+
+    # add noise to latents (new) # TODO per example std?
+    corr_std = jax.random.uniform(rngs()) * config.max_corruption_std
+    y = y + jax.random.normal(rngs(), y.shape) * y.std() * corr_std
+    z = z + jax.random.normal(rngs(), z.shape) * z.std() * corr_std
+
+    keep_alive = q_hat < 0.0  # TODO threshold as hparam?
+
+    # log metrics
+    preds = y_hat.argmax(axis=-1)
+    metrics = {
+        "train/loss": loss,
+        "train/cell_acc": (preds == y_true).mean(),
+        "train/solved_acc": (preds == y_true).all(axis=-1).mean(),
+        "train/prop_alive": carry.alive.mean(),
+        "train/mean_step": carry.step.astype(jnp.float32).mean(),
+        "train/max_step": carry.step.max(),
+        "train/grad_norm": optax.global_norm(grads),
+        "train/logit_mean": jnp.abs(y_hat).mean(),
+        "train/logit_std": jnp.std(y_hat),
+        "train/logit_max": jnp.max(y_hat),
+        "train/x_prenorm_scale": model.net.x_norm.scale.mean(),
+        "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
+        "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
+    }
+
+    # update carry
+    step = step + 1
+    # TODO carry this instead?
+    min_steps = (
+        jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
+    ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
+    alive = (step <= config.N_supervision) & (keep_alive | (step < min_steps))
+    carry = TrainBatchCarry(
+        step=step, x_input=x_input, y_true=y_true, y=y, z=z, alive=alive
     )
+
+    return carry, model, opt, new_ema_model, metrics
 
 
 @nnx.jit(static_argnames=("config"))
@@ -386,16 +369,16 @@ class Config:
 
     batch_size: int = 768
     lr: float = 1e-4
-    lr_warmup_steps: int = 2000 // 16
+    lr_warmup_steps: int = 2000
     weight_decay: float = 1.0
-    ema_beta: float = 0.999**16
+    ema_beta: float = 0.999
     steps: int = 25_000
 
     half_precision: bool = False
-    val_every: int = 250
+    val_every: int = 250 * 16
     workdir: str = None
     seed: int = None
-    checkpoint_every: int = 250
+    checkpoint_every: int = 250 * 16
     max_checkpoints: int = 3
 
 
@@ -514,12 +497,23 @@ if __name__ == "__main__":
             )
             exit(0)
 
+        bs, seq_len, h_dim = config.batch_size, config.seq_len, config.h_dim
+        carry = TrainBatchCarry(
+            step=jnp.zeros((bs, 1), dtype=jnp.int32),
+            x_input=jnp.empty((bs, seq_len), dtype=jnp.int32),
+            y_true=jnp.empty((bs, seq_len), dtype=jnp.int32),
+            y=jnp.empty((bs, seq_len, h_dim), dtype=compute_dtype),
+            z=jnp.empty((bs, seq_len, h_dim), dtype=compute_dtype),
+            alive=jnp.zeros((bs, 1), dtype=jnp.bool_),
+        )
+
         with metric_writers.ensure_flushes(writer):
             for step, batch in enumerate(train_loader, start=start_step):
                 if mesh is not None:
                     batch = shard_batch(batch)
-                model, opt, ema_model, train_metrics = train_step(
-                    model, ema_model, opt, batch, config, rngs
+
+                carry, model, opt, ema_model, train_metrics = train_step(
+                    carry, model, ema_model, opt, batch, config, rngs
                 )
                 train_metrics["train/lr"] = lr_schedule(step)
                 writer.write_scalars(step, train_metrics)
