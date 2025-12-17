@@ -204,7 +204,7 @@ def pred_metrics(y_hat, y_true, prefix):
 
 
 TrainBatchCarry = namedtuple(
-    "TrainBatchCarry", ["step", "x_input", "y_true", "y", "z", "alive"]
+    "TrainBatchCarry", ["step", "x_input", "y_true", "y", "z", "alive", "min_steps"]
 )
 
 
@@ -220,6 +220,14 @@ def train_step(carry, model, ema_model, opt, batch, config, rngs):
 
     # zero steps for halted examples
     step = carry.step * carry.alive.astype(jnp.int32)
+
+    # set min steps for new examples
+    min_steps = jnp.where(
+        carry.alive,
+        carry.min_steps,
+        (jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob)
+        * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1),
+    )
 
     # replace halted latents with init states
     y_init, z_init = (
@@ -267,13 +275,15 @@ def train_step(carry, model, ema_model, opt, batch, config, rngs):
 
     # update carry
     step = step + 1
-    # TODO carry this instead?
-    min_steps = (
-        jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
-    ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
-    alive = (step < config.N_supervision) & (keep_alive | (step < min_steps))
+    alive = (step <= config.N_supervision) & (keep_alive | (step < min_steps))
     carry = TrainBatchCarry(
-        step=step, x_input=x_input, y_true=y_true, y=y, z=z, alive=alive
+        step=step,
+        x_input=x_input,
+        y_true=y_true,
+        y=y,
+        z=z,
+        alive=alive,
+        min_steps=min_steps,
     )
 
     return carry, model, opt, new_ema_model, metrics
@@ -505,6 +515,7 @@ if __name__ == "__main__":
             y=jnp.empty((bs, seq_len, h_dim), dtype=compute_dtype),
             z=jnp.empty((bs, seq_len, h_dim), dtype=compute_dtype),
             alive=jnp.zeros((bs, 1), dtype=jnp.bool_),
+            min_steps=jnp.zeros((bs, 1), dtype=jnp.int32),
         )
 
         with metric_writers.ensure_flushes(writer):
