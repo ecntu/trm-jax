@@ -226,7 +226,7 @@ def train_step(carry, model, ema_model, opt, batch, config, rngs):
         carry.alive,
         carry.min_steps,
         (jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob)
-        * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1),
+        * jax.random.randint(rngs(), (bs, 1), 1, config.N_supervision + 1),  # min as 1?
     )
 
     # replace halted latents with init states
@@ -255,15 +255,27 @@ def train_step(carry, model, ema_model, opt, batch, config, rngs):
 
     keep_alive = q_hat < 0.0  # TODO threshold as hparam?
 
+    # update carry
+    alive = (step < config.N_supervision) & (keep_alive | (step < min_steps))
+    carry = TrainBatchCarry(
+        step=step + 1,
+        x_input=x_input,
+        y_true=y_true,
+        y=y,
+        z=z,
+        alive=alive,
+        min_steps=min_steps,
+    )
+
     # log metrics
     preds = y_hat.argmax(axis=-1)
     metrics = {
         "train/loss": loss,
         "train/cell_acc": (preds == y_true).mean(),
         "train/solved_acc": (preds == y_true).all(axis=-1).mean(),
-        "train/prop_alive": carry.alive.mean(),
-        "train/mean_step": carry.step.astype(jnp.float32).mean(),
-        "train/max_step": carry.step.max(),
+        "train/prop_alive": alive.mean(),
+        "train/mean_step": step.astype(jnp.float32).mean(),
+        "train/max_step": step.max(),
         "train/grad_norm": optax.global_norm(grads),
         "train/logit_mean": jnp.abs(y_hat).mean(),
         "train/logit_std": jnp.std(y_hat),
@@ -272,19 +284,6 @@ def train_step(carry, model, ema_model, opt, batch, config, rngs):
         "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
         "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
     }
-
-    # update carry
-    step = step + 1
-    alive = (step <= config.N_supervision) & (keep_alive | (step < min_steps))
-    carry = TrainBatchCarry(
-        step=step,
-        x_input=x_input,
-        y_true=y_true,
-        y=y,
-        z=z,
-        alive=alive,
-        min_steps=min_steps,
-    )
 
     return carry, model, opt, new_ema_model, metrics
 
