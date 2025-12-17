@@ -233,15 +233,16 @@ def train_step(model, ema_model, opt, batch, config, rngs):
     ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
 
     def sup_step(carry, _):
-        step, model, opt, y, z, alive, rngs = carry
+        step, model, opt, y_in, z_in, alive, rngs = carry
 
         # update step
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y, z, y_true, alive, config
+            model, x, y_in, z_in, y_true, alive, config
         )
         opt.update(model, grads)
 
-        # TODO IDEA -- stay on policy here
+        if config.stay_on_policy:
+            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=config.n, T=config.T)
 
         # add noise to latents (new) # TODO per example std?
         corr_std = jax.random.uniform(rngs()) * config.max_corruption_std
@@ -383,6 +384,7 @@ class Config:
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
     max_corruption_std: float = 0.0
+    stay_on_policy: bool = False
 
     batch_size: int = 768
     lr: float = 1e-4
