@@ -271,7 +271,7 @@ def train_step(carry, model, ema_model, opt, batch, config, rngs):
     min_steps = (
         jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
     ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
-    alive = (step <= config.N_supervision) & (keep_alive | (step < min_steps))
+    alive = (step < config.N_supervision) & (keep_alive | (step < min_steps))
     carry = TrainBatchCarry(
         step=step, x_input=x_input, y_true=y_true, y=y, z=z, alive=alive
     )
@@ -369,16 +369,16 @@ class Config:
 
     batch_size: int = 768
     lr: float = 1e-4
-    lr_warmup_steps: int = 2000
+    lr_warmup_steps: int = 2_000
     weight_decay: float = 1.0
     ema_beta: float = 0.999
     steps: int = 25_000
 
     half_precision: bool = False
-    val_every: int = 250 * 16
+    val_every: int = 1_000
     workdir: str = None
     seed: int = None
-    checkpoint_every: int = 250 * 16
+    checkpoint_every: int = 1_000
     max_checkpoints: int = 3
 
 
