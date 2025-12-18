@@ -486,6 +486,7 @@ if __name__ == "__main__":
             writer.write_scalars(step, m)
 
         def _checkpoint_callback(step, t):
+            checkpoint_manager.wait_until_finished()
             save_checkpoint(
                 checkpoint_manager, step, model, opt, ema_model, checkpoint_by["metric"]
             )
@@ -531,3 +532,5 @@ if __name__ == "__main__":
 
                 if step >= config.steps:
                     break
+
+        checkpoint_manager.wait_until_finished()
