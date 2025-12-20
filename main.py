@@ -461,8 +461,9 @@ if __name__ == "__main__":
         checkpoint_manager = None
         if config.workdir is not None:
             checkpoint_manager = ocp.CheckpointManager(
-                os.path.abspath(config.workdir),
-                ocp.PyTreeCheckpointer(),
+                config.workdir
+                if config.workdir.startswith("gs://")
+                else os.path.abspath(config.workdir),
                 options=ocp.CheckpointManagerOptions(
                     best_mode="max",
                     best_fn=lambda m: m,
@@ -486,7 +487,6 @@ if __name__ == "__main__":
             writer.write_scalars(step, m)
 
         def _checkpoint_callback(step, t):
-            checkpoint_manager.wait_until_finished()
             save_checkpoint(
                 checkpoint_manager, step, model, opt, ema_model, checkpoint_by["metric"]
             )
@@ -533,4 +533,7 @@ if __name__ == "__main__":
                 if step >= config.steps:
                     break
 
-        checkpoint_manager.wait_until_finished()
+        
+            if checkpoint_manager is not None:
+                checkpoint_manager.wait_until_finished()
+                checkpoint_manager.close()   # important: joins any internal workers
