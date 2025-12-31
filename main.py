@@ -244,10 +244,20 @@ def train_step(model, ema_model, opt, batch, config, rngs):
         if config.stay_on_policy:
             (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=config.n, T=config.T)
 
-        # add noise to latents (new) # TODO per example std?
-        corr_std = jax.random.uniform(rngs()) * config.max_corruption_std
-        y = y + jax.random.normal(rngs(), y.shape) * y.std() * corr_std
-        z = z + jax.random.normal(rngs(), z.shape) * z.std() * corr_std
+        # add noise to latents (new)
+        corr_std = (
+            (jax.random.uniform(rngs(), (bs, 1, 1)) >= config.corruption_clean_prop)
+            * jax.random.uniform(rngs(), (bs, 1, 1))
+            * config.max_corruption_std
+        )
+        y = (
+            y
+            + jax.random.normal(rngs(), y.shape) * y.std((-1), keepdims=True) * corr_std
+        )
+        z = (
+            z
+            + jax.random.normal(rngs(), z.shape) * z.std((-1), keepdims=True) * corr_std
+        )
 
         keep_alive = q_hat < 0.0  # TODO threshold as hparam?
         alive = alive & (keep_alive | (step < min_steps))
@@ -384,6 +394,7 @@ class Config:
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
     max_corruption_std: float = 0.0
+    corruption_clean_prop: float = 0.5
     stay_on_policy: bool = False
 
     batch_size: int = 768
@@ -533,7 +544,6 @@ if __name__ == "__main__":
                 if step >= config.steps:
                     break
 
-        
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()
-                checkpoint_manager.close()   # important: joins any internal workers
+                checkpoint_manager.close()  # important: joins any internal workers
