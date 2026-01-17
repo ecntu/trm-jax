@@ -130,7 +130,7 @@ class Net(nnx.Module):
     def __init__(self, seq_len, h_dim, expansion, n_layers, linear, rngs):
         # normalize x, y, z separately before adding
         norm = partial(nnx.RMSNorm, num_features=h_dim, dtype=jnp.float32, rngs=rngs)
-        self.x_norm, self.y_norm, self.z_norm = (norm(), norm(), norm())
+        self.x_norm, self.y_norm, self.z_norm = (norm(), norm(), norm()) # TODO why does one of these go to zero?
 
         self.net = nnx.Sequential(
             *[

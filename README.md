@@ -8,6 +8,7 @@ Run with:
 uv run --with jax\[tpu\] main.py --workdir logs/run_name
 ```
 ### Todo
+- [ ] Test and upload a checkpoint
 - [ ] Match paper performance (>85% solve rate)
 - [ ] Fix random seed determinism
 
