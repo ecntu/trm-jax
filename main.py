@@ -474,14 +474,14 @@ if __name__ == "__main__":
         ema_model = nnx.clone(model)
 
         checkpoint_manager = None
-        if config.workdir is not None:
+        if config.workdir is not None and config.max_checkpoints > 0:
             checkpoint_manager = ocp.CheckpointManager(
                 config.workdir
                 if config.workdir.startswith("gs://")
                 else os.path.abspath(config.workdir),
                 options=ocp.CheckpointManagerOptions(
                     best_mode="max",
-                    best_fn=lambda m: m,
+                    best_fn=lambda m: m["eval/solved_acc"],
                     max_to_keep=config.max_checkpoints,
                 ),
             )
@@ -494,16 +494,23 @@ if __name__ == "__main__":
         writer.write_scalars(0, {"hparams/n_params": n_params})
 
         start_step = restore_checkpoint(checkpoint_manager, model, opt, ema_model)
-        checkpoint_by = {"metric": None}
+        last_eval_metrics = {"metrics": None}
 
         def _val_callback(step, t):
             m = evaluate_epoch(ema_model, val_loader, config, rngs, mesh)
-            checkpoint_by["metric"] = float(m["eval/solved_acc"])
+            last_eval_metrics["metrics"] = m
             writer.write_scalars(step, m)
 
         def _checkpoint_callback(step, t):
+            if last_eval_metrics["metrics"] is None:
+                return
             save_checkpoint(
-                checkpoint_manager, step, model, opt, ema_model, checkpoint_by["metric"]
+                checkpoint_manager,
+                step,
+                model,
+                opt,
+                ema_model,
+                last_eval_metrics["metrics"],
             )
 
         hooks = [
@@ -515,12 +522,15 @@ if __name__ == "__main__":
                 on_steps=[config.steps],
                 callback_fn=_val_callback,
             ),
-            periodic_actions.PeriodicCallback(
-                every_steps=config.checkpoint_every,
-                on_steps=[config.steps],
-                callback_fn=_checkpoint_callback,
-            ),
         ]
+        if checkpoint_manager is not None:
+            hooks.append(
+                periodic_actions.PeriodicCallback(
+                    every_steps=config.checkpoint_every,
+                    on_steps=[config.steps],
+                    callback_fn=_checkpoint_callback,
+                )
+            )
         if config.workdir is not None and jax.process_index() == 0:
             hooks.append(
                 periodic_actions.Profile(num_profile_steps=5, logdir=config.workdir)

@@ -4,6 +4,7 @@ from collections import deque
 from datasets import Dataset
 from flax import nnx
 from absl import logging
+import orbax.checkpoint as ocp
 
 
 class Loader:
@@ -79,8 +80,14 @@ def restore_checkpoint(manager, model, opt, ema_model):
         return 1
 
     latest_step = manager.latest_step()
+    targets = checkpoint_targets(model, opt, ema_model)
     restored = manager.restore(
-        latest_step, items=checkpoint_targets(model, opt, ema_model)
+        latest_step,
+        args=ocp.args.Composite(
+            model=ocp.args.StandardRestore(targets["model"]),
+            opt=ocp.args.StandardRestore(targets["opt"]),
+            ema_model=ocp.args.StandardRestore(targets["ema_model"]),
+        ),
     )
     nnx.update(model, restored["model"])
     nnx.update(opt, restored["opt"])
@@ -89,7 +96,27 @@ def restore_checkpoint(manager, model, opt, ema_model):
     return int(latest_step) + 1
 
 
-def save_checkpoint(manager, step, model, opt, ema_model, metrics=None):
+def save_checkpoint(
+    manager: ocp.CheckpointManager,
+    step: int,
+    model: nnx.Module,
+    opt: nnx.Optimizer,
+    ema_model: nnx.Module,
+    metrics=None,
+):
     if manager is None or jax.process_index() != 0:
         return
-    manager.save(step, checkpoint_targets(model, opt, ema_model), metrics=metrics)
+    targets = checkpoint_targets(model, opt, ema_model)
+    if metrics is not None:
+        metrics = jax.tree_util.tree_map(
+            lambda x: float(jax.device_get(x)), metrics
+        )
+    manager.save(
+        step,
+        args=ocp.args.Composite(
+            model=ocp.args.StandardSave(targets["model"]),
+            opt=ocp.args.StandardSave(targets["opt"]),
+            ema_model=ocp.args.StandardSave(targets["ema_model"]),
+        ),
+        metrics=metrics,
+    )
