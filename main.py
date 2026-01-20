@@ -412,6 +412,7 @@ class Config:
     val_every: int = 500
     workdir: str = None
     eval_only: bool = False
+    run_final_eval: bool = False
     seed: int = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
@@ -560,7 +561,8 @@ if __name__ == "__main__":
             logging.info(
                 f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); evaluating."
             )
-            _run_test()
+            if config.run_final_eval:
+                _run_test()
             exit(0)
 
         if config.eval_only:
@@ -589,7 +591,8 @@ if __name__ == "__main__":
                 if step >= config.steps:
                     break
 
-            _run_test()
+            if config.run_final_eval:
+                _run_test()
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()  # important: joins any internal workers
