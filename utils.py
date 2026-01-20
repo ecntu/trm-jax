@@ -75,7 +75,9 @@ def checkpoint_targets(model, opt, ema_model):
     }
 
 
-def restore_checkpoint(manager, model, opt, ema_model):
+def restore_checkpoint(
+    manager, model, opt, ema_model, items=("model", "opt", "ema_model")
+):
     if manager is None or manager.latest_step() is None:
         return 1
 
@@ -84,14 +86,19 @@ def restore_checkpoint(manager, model, opt, ema_model):
     restored = manager.restore(
         latest_step,
         args=ocp.args.Composite(
-            model=ocp.args.StandardRestore(targets["model"]),
-            opt=ocp.args.StandardRestore(targets["opt"]),
-            ema_model=ocp.args.StandardRestore(targets["ema_model"]),
+            **{
+                k: ocp.args.StandardRestore(v)
+                for k, v in targets.items()
+                if k in items
+            }
         ),
     )
-    nnx.update(model, restored["model"])
-    nnx.update(opt, restored["opt"])
-    nnx.update(ema_model, restored["ema_model"])
+    if "model" in restored:
+        nnx.update(model, restored["model"])
+    if "opt" in restored:
+        nnx.update(opt, restored["opt"])
+    if "ema_model" in restored:
+        nnx.update(ema_model, restored["ema_model"])
     logging.info(f"Restored checkpoint at step {latest_step}")
     return int(latest_step) + 1
 

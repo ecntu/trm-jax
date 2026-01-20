@@ -411,6 +411,7 @@ class Config:
     half_precision: bool = False
     val_every: int = 500
     workdir: str = None
+    eval_only: bool = False
     seed: int = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
@@ -474,7 +475,9 @@ if __name__ == "__main__":
         ema_model = nnx.clone(model)
 
         checkpoint_manager = None
-        if config.workdir is not None and config.max_checkpoints > 0:
+        if config.workdir is not None and (
+            config.max_checkpoints > 0 or config.eval_only
+        ):
             checkpoint_manager = ocp.CheckpointManager(
                 config.workdir
                 if config.workdir.startswith("gs://")
@@ -493,13 +496,30 @@ if __name__ == "__main__":
         writer.write_hparams(vars(config))
         writer.write_scalars(0, {"hparams/n_params": n_params})
 
-        start_step = restore_checkpoint(checkpoint_manager, model, opt, ema_model)
+        # restore
+        restore_items = (
+            ("ema_model",) if config.eval_only else ("model", "opt", "ema_model")
+        )
+        start_step = restore_checkpoint(
+            checkpoint_manager, model, opt, ema_model, items=restore_items
+        )
+
+        # some callbacks
         last_eval_metrics = {"metrics": None}
 
         def _val_callback(step, t):
             m = evaluate_epoch(ema_model, val_loader, config, rngs, mesh)
             last_eval_metrics["metrics"] = m
             writer.write_scalars(step, m)
+
+        def _run_test():
+            logging.info("Running test evaluation...")
+            test_metrics = evaluate_epoch(ema_model, test_loader, config, rngs, mesh)
+            test_metrics = {
+                k.replace("eval/", "test/"): v for k, v in test_metrics.items()
+            }
+            writer.write_scalars(0, test_metrics)
+            logging.info(f"Test metrics: {test_metrics}")
 
         def _checkpoint_callback(step, t):
             if last_eval_metrics["metrics"] is None:
@@ -538,8 +558,19 @@ if __name__ == "__main__":
 
         if start_step > config.steps:
             logging.info(
-                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); exiting."
+                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); evaluating."
             )
+            _run_test()
+            exit(0)
+
+        if config.eval_only:
+            restored_step = start_step - 1
+            if restored_step <= 0:
+                logging.error(
+                    "No checkpoint found for eval_only run. Provide a workdir with a checkpoint."
+                )
+                exit(1)
+            _run_test()
             exit(0)
 
         with metric_writers.ensure_flushes(writer):
@@ -558,6 +589,7 @@ if __name__ == "__main__":
                 if step >= config.steps:
                     break
 
+            _run_test()
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()  # important: joins any internal workers
