@@ -2,13 +2,18 @@ A simple JAX reproduction of the [Tiny Recursion Model](https://arxiv.org/abs/25
 
 Thanks to the [TPU Research Cloud](https://sites.research.google/trc/about/) program for the compute!
 
-Run with: 
+Running with 
 
 ```bash
 uv run --with jax\[tpu\] main.py --workdir logs/run_name
 ```
+
+currently yields this run and [checkpoint](https://huggingface.co/emiliocantuc/trm_test):
+
+<img width="1256" height="428" alt="Screenshot 2026-01-20 at 9 19 44 AM" src="https://github.com/user-attachments/assets/52d83aaf-4794-4879-a6b2-85a15d0f97e9" />
+
+
 ### Todo
-- [ ] Test and upload a checkpoint
 - [ ] Match paper performance (>85% solve rate)
 - [ ] Fix random seed determinism
 
