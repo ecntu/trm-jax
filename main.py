@@ -413,6 +413,7 @@ class Config:
     workdir: str = None
     eval_only: bool = False
     run_final_eval: bool = False
+    test_subset_size: int = 0
     seed: int = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
@@ -439,6 +440,8 @@ if __name__ == "__main__":
     # train_ds = load_dataset(config.dataset, split=f"train[:{config.batch_size}]") # debug by overfitting to single batch
     val_ds = load_dataset(config.dataset, split="test[:1024]")
     test_ds = load_dataset(config.dataset, split="test")
+    if config.test_subset_size:
+        test_ds = test_ds.shuffle(seed=seed).select(range(config.test_subset_size))
 
     train_loader = Loader(train_ds, batch_size=config.batch_size, shuffle_seed=seed)
     val_loader = Loader(val_ds, batch_size=config.batch_size, epochs=1)
@@ -557,14 +560,6 @@ if __name__ == "__main__":
                 periodic_actions.Profile(num_profile_steps=5, logdir=config.workdir)
             )
 
-        if start_step > config.steps:
-            logging.info(
-                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); evaluating."
-            )
-            if config.run_final_eval:
-                _run_test()
-            exit(0)
-
         if config.eval_only:
             restored_step = start_step - 1
             if restored_step <= 0:
@@ -573,6 +568,14 @@ if __name__ == "__main__":
                 )
                 exit(1)
             _run_test()
+            exit(0)
+
+        if start_step > config.steps:
+            logging.info(
+                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); evaluating."
+            )
+            if config.run_final_eval:
+                _run_test()
             exit(0)
 
         with metric_writers.ensure_flushes(writer):
