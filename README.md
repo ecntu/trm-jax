@@ -15,7 +15,6 @@ currently yields this run and [checkpoint](https://huggingface.co/emiliocantuc/t
 
 ### Todo
 - [ ] Match paper performance (>85% solve rate)
-- [ ] Fix random seed determinism
 
 ### Citations
 

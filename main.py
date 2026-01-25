@@ -443,7 +443,16 @@ if __name__ == "__main__":
     tpu = jax.default_backend() == "tpu"
     param_dtype = jnp.float32
     compute_dtype = jnp.bfloat16 if tpu and config.half_precision else jnp.float32
+
     seed = config.seed or random.randint(0, 2**32 - 1)
+
+    # Enable XLA determinism only when explicit seed is provided
+    if config.seed is not None:
+        os.environ["XLA_FLAGS"] = (
+            os.environ.get("XLA_FLAGS", "")
+            + " --xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0"
+        )
+
     rngs = nnx.Rngs(seed)
 
     num_devices = jax.device_count()
