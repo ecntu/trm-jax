@@ -204,12 +204,12 @@ def loss_fn(model, x, y, z, y_true, alive, config):
 grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
 
-def pred_metrics(y_hat, y_true, prefix):
+def pred_metrics(y_hat, y_true, prefix, train_N=None):
     N, *_ = y_hat.shape
     preds = y_hat.argmax(axis=-1)
     cell_acc = (preds == y_true).mean(axis=(-1, -2))
     solved_acc = (preds == y_true).all(axis=-1).mean(axis=-1)
-    return {
+    metrics = {
         f"{prefix}/cell_acc": cell_acc[-1],
         f"{prefix}/cell_acc_first_delta": cell_acc[-1] - cell_acc[0],
         f"{prefix}/cell_acc_halfway_delta": cell_acc[-1] - cell_acc[N // 2],
@@ -217,6 +217,14 @@ def pred_metrics(y_hat, y_true, prefix):
         f"{prefix}/solved_acc_first_delta": solved_acc[-1] - solved_acc[0],
         f"{prefix}/solved_acc_halfway_delta": solved_acc[-1] - solved_acc[N // 2],
     }
+    if train_N is not None and train_N < N:
+        metrics[f"{prefix}/cell_acc_train_length_delta"] = (
+            cell_acc[-1] - cell_acc[train_N - 1]
+        )
+        metrics[f"{prefix}/solved_acc_train_length_delta"] = (
+            solved_acc[-1] - solved_acc[train_N - 1]
+        )
+    return metrics
 
 
 @nnx.jit(static_argnames=("config"))
@@ -316,11 +324,18 @@ def eval_step(model, batch, config, rngs):
     model.eval()
 
     x_input, y_true = batch["inputs"], batch["labels"]
+    effective_N = int(config.N_supervision * config.N_supervision_eval_mult)
     y_hats = model.predict(
-        x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
+        x_input,
+        N_supervision=effective_N,
+        n=config.n,
+        T=config.T,
+        rngs=rngs,
     )
+    train_N = config.N_supervision if effective_N > config.N_supervision else None
     return {
-        **pred_metrics(y_hats, y_true, prefix="eval"),
+        **pred_metrics(y_hats, y_true, prefix="eval", train_N=train_N),
+        "eval/effective_N_supervision": effective_N,
         "batch_size": x_input.shape[0],
     }
 
@@ -408,11 +423,13 @@ class Config:
     ema_beta: float = 0.999**16
     steps: int = 15_000
 
+    eval_only: bool = False
+    run_final_eval: bool = False
+    N_supervision_eval_mult: float = 1.0
+
     half_precision: bool = False
     val_every: int = 500
     workdir: str = None
-    eval_only: bool = False
-    run_final_eval: bool = False
     test_subset_size: int = 0
     seed: int = None
     checkpoint_every: int = 500
