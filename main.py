@@ -434,6 +434,7 @@ class Config:
     seed: int = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
+    use_parallel: bool = True
 
 
 if __name__ == "__main__":
@@ -446,11 +447,12 @@ if __name__ == "__main__":
     rngs = nnx.Rngs(seed)
 
     num_devices = jax.device_count()
-    if num_devices > 1:
+    if config.use_parallel and num_devices > 1:
         mesh = jax.make_mesh((num_devices,), ("data",))
         nnx.use_eager_sharding(True)
     else:
         mesh = None
+        nnx.use_eager_sharding(False)
     print(f"Using mesh: {mesh}")
 
     train_ds = load_dataset(config.dataset, split="train")
