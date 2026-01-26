@@ -415,7 +415,7 @@ class Config:
     N_supervision: int = 16
     n: int = 6
     T: int = 3
-    random_T: bool = True
+    random_T: bool = False
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
     max_corruption_std: float = 0.0
