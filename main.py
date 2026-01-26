@@ -172,8 +172,8 @@ class InitState(nnx.Module):
         return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
 
 
-def loss_fn(model, x, y, z, y_true, alive, config):
-    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=config.n, T=config.T)
+def loss_fn(model, x, y, z, y_true, alive, config, T):
+    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=config.n, T=T)
 
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
     alive = alive.astype(jnp.float32)
@@ -240,6 +240,11 @@ def train_step(model, ema_model, opt, batch, config, rngs):
         model.init_z(bs, seq_len, rngs),
     )
 
+    if config.random_T:
+        T = jax.random.randint(rngs(), shape=(), minval=1, maxval=config.T + 1)
+    else:
+        T = config.T
+
     min_steps = (
         jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
     ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
@@ -249,12 +254,12 @@ def train_step(model, ema_model, opt, batch, config, rngs):
 
         # update step
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y_in, z_in, y_true, alive, config
+            model, x, y_in, z_in, y_true, alive, config, T
         )
         opt.update(model, grads)
 
         if config.stay_on_policy:
-            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=config.n, T=config.T)
+            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=config.n, T=T)
 
         # add noise to latents (new)
         corr_std = (
@@ -410,6 +415,7 @@ class Config:
     N_supervision: int = 16
     n: int = 6
     T: int = 3
+    random_T: bool = True
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
     max_corruption_std: float = 0.0
