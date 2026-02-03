@@ -15,6 +15,7 @@ currently yields this run and [checkpoint](https://huggingface.co/emiliocantuc/t
 
 ### Todo
 - [ ] Match paper performance (>85% solve rate)
+- [ ] Log test N_sup vs performance curves
 
 ### Citations
 
