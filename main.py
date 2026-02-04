@@ -224,7 +224,7 @@ def pred_metrics(y_hat, y_true, prefix, train_N=None):
         metrics[f"{prefix}/solved_acc_train_length_delta"] = (
             solved_acc[-1] - solved_acc[train_N - 1]
         )
-    return metrics
+    return metrics, cell_acc, solved_acc
 
 
 @nnx.jit(static_argnames=("config"))
@@ -324,10 +324,9 @@ def train_step(model, ema_model, opt, batch, config, rngs):
     )
 
 
-@nnx.jit(static_argnames=("config"))
+@nnx.jit(static_argnames=("config",))
 def eval_step(model, batch, config, rngs):
     model.eval()
-
     x_input, y_true = batch["inputs"], batch["labels"]
     effective_N = int(config.N_supervision * config.N_supervision_eval_mult)
     y_hats = model.predict(
@@ -338,26 +337,50 @@ def eval_step(model, batch, config, rngs):
         rngs=rngs,
     )
     train_N = config.N_supervision if effective_N > config.N_supervision else None
+    metrics, cell_acc, solved_acc = pred_metrics(
+        y_hats, y_true, prefix="eval", train_N=train_N
+    )
     return {
-        **pred_metrics(y_hats, y_true, prefix="eval", train_N=train_N),
+        **metrics,
         "eval/effective_N_supervision": effective_N,
+        "cell_acc_per_step": cell_acc,
+        "solved_acc_per_step": solved_acc,
         "batch_size": x_input.shape[0],
     }
 
 
-def evaluate_epoch(model, data_iter, config, rngs, mesh=None):
+def evaluate_epoch(model, data_iter, config, rngs, mesh=None, log_curves=False):
     totals = defaultdict(float)
     total_weight = 0.0
+    all_cell_acc_steps = []
+    all_solved_acc_steps = []
 
     for batch in data_iter:
         if mesh is not None:
             batch = shard_batch(batch)
         metrics = eval_step(model, batch, config, rngs)
         bs = float(metrics.pop("batch_size"))
+
+        if log_curves:
+            all_cell_acc_steps.append(metrics.pop("cell_acc_per_step") * bs)
+            all_solved_acc_steps.append(metrics.pop("solved_acc_per_step") * bs)
+        else:
+            metrics.pop("cell_acc_per_step", None)
+            metrics.pop("solved_acc_per_step", None)
+
         for k, v in metrics.items():
             totals[k] += v * bs
         total_weight += bs
-    return {k: v / total_weight for k, v in totals.items()}
+
+    results = {k: v / total_weight for k, v in totals.items()}
+
+    if log_curves:
+        cell_acc_per_step = sum(all_cell_acc_steps) / total_weight
+        solved_acc_per_step = sum(all_solved_acc_steps) / total_weight
+        results["_curve_cell_acc"] = cell_acc_per_step
+        results["_curve_solved_acc"] = solved_acc_per_step
+
+    return results
 
 
 def model_factory(config, param_dtype, compute_dtype, rngs):
@@ -552,11 +575,27 @@ if __name__ == "__main__":
 
         def _run_test():
             logging.info("Running test evaluation...")
-            test_metrics = evaluate_epoch(ema_model, test_loader, config, rngs, mesh)
+            test_metrics = evaluate_epoch(
+                ema_model, test_loader, config, rngs, mesh, log_curves=True
+            )
+
+            curve_cell_acc = test_metrics.pop("_curve_cell_acc", None)
+            curve_solved_acc = test_metrics.pop("_curve_solved_acc", None)
+
             test_metrics = {
                 k.replace("eval/", "test/"): v for k, v in test_metrics.items()
             }
             writer.write_scalars(0, test_metrics)
+
+            if curve_cell_acc is not None:
+                for i in range(len(curve_cell_acc)):
+                    writer.write_scalars(
+                        i + 1,
+                        {
+                            "test_curve/cell_acc": float(curve_cell_acc[i]),
+                            "test_curve/solved_acc": float(curve_solved_acc[i]),
+                        },
+                    )
             logging.info(f"Test metrics: {test_metrics}")
 
         def _checkpoint_callback(step, t):
