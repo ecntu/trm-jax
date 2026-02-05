@@ -71,21 +71,25 @@ class TRM(nnx.Module):
         y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
         return (y, z), self.output_head(y), self.Q_head(y)
 
-    def predict(self, x_input, N_supervision=16, n=6, T=3, rngs=None):
+    def predict(self, x_input, y=None, z=None, N_supervision=16, n=6, T=3, rngs=None):
         x = self.input_embedding(x_input)
         batch_size, seq_len, _ = x.shape
-        y, z = (
-            self.init_y(batch_size, seq_len, rngs),
-            self.init_z(batch_size, seq_len, rngs),
-        )
+
+        if y is None or z is None:
+            y, z = (
+                self.init_y(batch_size, seq_len, rngs),
+                self.init_z(batch_size, seq_len, rngs),
+            )
 
         def supervision_step(carry, _):
             y, z = carry
             (y, z), y_hat, _ = self(x=x, y=y, z=z, n=n, T=T)
             return (y, z), y_hat
 
-        _, y_hats = lax.scan(supervision_step, (y, z), None, length=N_supervision)
-        return y_hats  # (N, B, L, C)
+        (ys, zs), y_hats = lax.scan(
+            supervision_step, (y, z), None, length=N_supervision
+        )
+        return y_hats, (ys, zs)
 
 
 def _find_multiple(a, b):
@@ -130,11 +134,7 @@ class Net(nnx.Module):
     def __init__(self, seq_len, h_dim, expansion, n_layers, linear, rngs):
         # normalize x, y, z separately before adding
         norm = partial(nnx.RMSNorm, num_features=h_dim, dtype=jnp.float32, rngs=rngs)
-        self.x_norm, self.y_norm, self.z_norm = (
-            norm(),
-            norm(),
-            norm(),
-        )  # TODO why does one of these go to zero?
+        self.x_norm, self.y_norm, self.z_norm = (norm(), norm(), norm())
 
         self.net = nnx.Sequential(
             *[
@@ -224,10 +224,11 @@ def pred_metrics(y_hat, y_true, prefix, train_N=None):
         metrics[f"{prefix}/solved_acc_train_length_delta"] = (
             solved_acc[-1] - solved_acc[train_N - 1]
         )
+    # TODO clean this up
     return metrics, cell_acc, solved_acc
 
 
-@nnx.jit(static_argnames=("config"))
+@nnx.jit(static_argnames=("config",))
 def train_step(model, ema_model, opt, batch, config, rngs):
     model.train()
 
@@ -319,7 +320,7 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             "train/x_prenorm_scale": model.net.x_norm.scale.mean(),
             "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
             "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
-            **pred_metrics(y_hats, y_true, prefix="train"),
+            **pred_metrics(y_hats, y_true, prefix="train")[0],
         },
     )
 
@@ -329,7 +330,7 @@ def eval_step(model, batch, config, rngs):
     model.eval()
     x_input, y_true = batch["inputs"], batch["labels"]
     effective_N = int(config.N_supervision * config.N_supervision_eval_mult)
-    y_hats = model.predict(
+    y_hats, _ = model.predict(
         x_input,
         N_supervision=effective_N,
         n=config.n,
@@ -381,6 +382,53 @@ def evaluate_epoch(model, data_iter, config, rngs, mesh=None, log_curves=False):
         results["_curve_solved_acc"] = solved_acc_per_step
 
     return results
+
+
+@nnx.jit(static_argnames=("config",))
+def asymptotic_alignment_score(model, batch, config, rngs):
+    model.eval()
+    x_input = batch["inputs"]
+
+    def cos_sim(a, b):
+        a, b = rearrange(a, "b ... -> b (...)"), rearrange(b, "b ... -> b (...)")
+        return (a * b).sum(-1) / (
+            jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
+        )
+
+    _, (y1, z1) = model.predict(
+        x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
+    )
+    _, (y2, z2) = model.predict(
+        x_input,
+        y=y1,
+        z=z1,
+        N_supervision=config.N_supervision,
+        n=config.n,
+        T=config.T,
+        rngs=rngs,
+    )
+
+    return {
+        "asymptotic_alignment/y_cos_sim": cos_sim(y1, y2).mean(),
+        "asymptotic_alignment/z_cos_sim": cos_sim(z1, z2).mean(),
+    }
+
+
+def calc_metric_over_batches(metric_fn, data_iter, mesh=None, num_batches=100):
+    """Generic function to calculate metrics over multiple batches and average."""
+    totals = defaultdict(float)
+
+    for i, batch in enumerate(data_iter):
+        if i >= num_batches:
+            break
+        if mesh is not None:
+            batch = shard_batch(batch)
+
+        metrics = metric_fn(batch)
+        for k, v in metrics.items():
+            totals[k] += v
+
+    return {k: v / num_batches for k, v in totals.items()}
 
 
 def model_factory(config, param_dtype, compute_dtype, rngs):
@@ -618,6 +666,19 @@ if __name__ == "__main__":
                 every_steps=config.val_every,
                 on_steps=[config.steps],
                 callback_fn=_val_callback,
+            ),
+            periodic_actions.PeriodicCallback(
+                every_steps=config.val_every,
+                callback_fn=lambda step, t: writer.write_scalars(
+                    step,
+                    calc_metric_over_batches(
+                        lambda batch: asymptotic_alignment_score(
+                            ema_model, batch, config, rngs
+                        ),
+                        iter(val_loader),
+                        mesh,
+                    ),
+                ),
             ),
         ]
         if checkpoint_manager is not None:
