@@ -386,6 +386,7 @@ def evaluate_epoch(model, data_iter, config, rngs, mesh=None, log_curves=False):
 
 @nnx.jit(static_argnames=("config",))
 def asymptotic_alignment_score(model, batch, config, rngs):
+    """arxiv:2211.09961"""
     model.eval()
     x_input = batch["inputs"]
 
@@ -398,10 +399,15 @@ def asymptotic_alignment_score(model, batch, config, rngs):
     _, (y1, z1) = model.predict(
         x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
     )
+
+    # Shift y1 and z1 down by 1 to use hidden states from other examples in the batch
+    y1_shifted = jnp.roll(y1, shift=1, axis=0)
+    z1_shifted = jnp.roll(z1, shift=1, axis=0)
+
     _, (y2, z2) = model.predict(
         x_input,
-        y=y1,
-        z=z1,
+        y=y1_shifted,
+        z=z1_shifted,
         N_supervision=config.N_supervision,
         n=config.n,
         T=config.T,
