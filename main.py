@@ -207,9 +207,8 @@ def loss_fn(model, x, y, z, y_true, alive, config, T):
 grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
 
-def pred_metrics(y_hat, y_true, prefix, train_N=None, return_curves=False):
-    N, *_ = y_hat.shape
-    preds = y_hat.argmax(axis=-1)
+def pred_metrics(preds, y_true, prefix, train_N=None, return_curves=False):
+    N, *_ = preds.shape
     cell_acc = (preds == y_true).mean(axis=(-1, -2))
     solved_acc = (preds == y_true).all(axis=-1).mean(axis=-1)
     metrics = {
@@ -325,7 +324,7 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             "train/x_prenorm_scale": model.net.x_norm.scale.mean(),
             "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
             "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
-            **pred_metrics(y_hats, y_true, prefix="train"),
+            **pred_metrics(y_hats.argmax(axis=-1), y_true, prefix="train"),
         },
     )
 
@@ -335,16 +334,25 @@ def eval_step(model, batch, config, rngs):
     model.eval()
     x_input, y_true = batch["inputs"], batch["labels"]
     effective_N = int(config.N_supervision * config.N_supervision_eval_mult)
-    y_hats, _ = model.predict(
-        x_input,
-        N_supervision=effective_N,
-        n=config.n,
-        T=config.T,
-        rngs=rngs,
-    )
+    keys = jax.random.split(rngs(), config.eval_k)
+
+    def one_pred(key):
+        run_rngs = nnx.Rngs(key)
+        y_hats, _ = model.predict(
+            x_input,
+            N_supervision=effective_N,
+            n=config.n,
+            T=config.T,
+            rngs=run_rngs,
+        )
+        return y_hats.argmax(axis=-1)
+
+    k_preds = jax.vmap(one_pred)(keys)  # (k, n, b, l)
+    preds = jnp.argmax(jax.nn.one_hot(k_preds, config.vocab_size).sum(axis=0), axis=-1)
+
     train_N = config.N_supervision if effective_N > config.N_supervision else None
     metrics, cell_acc, solved_acc = pred_metrics(
-        y_hats, y_true, prefix="eval", train_N=train_N, return_curves=True
+        preds, y_true, prefix="eval", train_N=train_N, return_curves=True
     )
     return {
         **metrics,
@@ -501,6 +509,7 @@ class Config:
     eval_only: bool = False
     run_final_eval: bool = False
     N_supervision_eval_mult: float = 1.0
+    eval_k: int = 1
 
     half_precision: bool = False
     val_every: int = 500
