@@ -1,10 +1,19 @@
 import numpy as np
 import jax
-from collections import deque
+from jax.sharding import PartitionSpec as P
+from collections import deque, defaultdict
 from datasets import Dataset
 from flax import nnx
 from absl import logging
 import orbax.checkpoint as ocp
+
+
+def shard_batch(batch):
+    # data parallel sharding
+    return {
+        "inputs": jax.device_put(batch["inputs"], P("data", None)),
+        "labels": jax.device_put(batch["labels"], P("data", None)),
+    }
 
 
 class Loader:
@@ -86,11 +95,7 @@ def restore_checkpoint(
     restored = manager.restore(
         latest_step,
         args=ocp.args.Composite(
-            **{
-                k: ocp.args.StandardRestore(v)
-                for k, v in targets.items()
-                if k in items
-            }
+            **{k: ocp.args.StandardRestore(v) for k, v in targets.items() if k in items}
         ),
     )
     if "model" in restored:
@@ -115,9 +120,7 @@ def save_checkpoint(
         return
     targets = checkpoint_targets(model, opt, ema_model)
     if metrics is not None:
-        metrics = jax.tree_util.tree_map(
-            lambda x: float(jax.device_get(x)), metrics
-        )
+        metrics = jax.tree_util.tree_map(lambda x: float(jax.device_get(x)), metrics)
     manager.save(
         step,
         args=ocp.args.Composite(
@@ -127,3 +130,20 @@ def save_checkpoint(
         ),
         metrics=metrics,
     )
+
+
+def calc_metric_over_batches(metric_fn, data_iter, mesh=None, num_batches=100):
+    """Generic function to calculate metrics over multiple batches and average."""
+    totals = defaultdict(float)
+
+    for i, batch in enumerate(data_iter):
+        if i >= num_batches:
+            break
+        if mesh is not None:
+            batch = shard_batch(batch)
+
+        metrics = metric_fn(batch)
+        for k, v in metrics.items():
+            totals[k] += v
+
+    return {k: v / num_batches for k, v in totals.items()}

@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.lax import stop_gradient as sg
-from jax.sharding import PartitionSpec as P
 from flax import nnx
 import orbax.checkpoint as ocp
 from einops import rearrange, reduce
@@ -22,7 +21,13 @@ from clu import metric_writers, periodic_actions
 import simple_parsing
 
 from datasets import load_dataset
-from utils import Loader, restore_checkpoint, save_checkpoint
+from utils import (
+    Loader,
+    restore_checkpoint,
+    save_checkpoint,
+    calc_metric_over_batches,
+    shard_batch,
+)
 
 logging.set_verbosity(logging.INFO)
 
@@ -96,7 +101,6 @@ def _find_multiple(a, b):
     return (-(a // -b)) * b
 
 
-# TODO swap out with less elementwise ops?
 class SwiGLU(nnx.Module):
     """SwiGLU(x, W1, W2, W3) = W2(SiLU(W1x) * W3x)"""
 
@@ -154,7 +158,6 @@ class Net(nnx.Module):
         return self.net(self.x_norm(x) + self.y_norm(y) + self.z_norm(z))
 
 
-# TODO flax.nnx.initializers.truncated_normal?
 class InitState(nnx.Module):
     def __init__(self, mode, h_dim, rngs):
         self.scale = jnp.sqrt(1 / h_dim)  # match input emb scale
@@ -204,7 +207,7 @@ def loss_fn(model, x, y, z, y_true, alive, config, T):
 grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
 
-def pred_metrics(y_hat, y_true, prefix, train_N=None):
+def pred_metrics(y_hat, y_true, prefix, train_N=None, return_curves=False):
     N, *_ = y_hat.shape
     preds = y_hat.argmax(axis=-1)
     cell_acc = (preds == y_true).mean(axis=(-1, -2))
@@ -224,8 +227,10 @@ def pred_metrics(y_hat, y_true, prefix, train_N=None):
         metrics[f"{prefix}/solved_acc_train_length_delta"] = (
             solved_acc[-1] - solved_acc[train_N - 1]
         )
-    # TODO clean this up
-    return metrics, cell_acc, solved_acc
+    if return_curves:
+        return metrics, cell_acc, solved_acc
+    else:
+        return metrics
 
 
 @nnx.jit(static_argnames=("config",))
@@ -262,7 +267,7 @@ def train_step(model, ema_model, opt, batch, config, rngs):
         if config.stay_on_policy:
             (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=config.n, T=T)
 
-        # add noise to latents (new)
+        # add noise to latents (new) TODO mess with std shape
         corr_std = (
             (jax.random.uniform(rngs(), (bs, 1, 1)) >= config.corruption_clean_prop)
             * jax.random.uniform(rngs(), (bs, 1, 1))
@@ -277,7 +282,7 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             + jax.random.normal(rngs(), z.shape) * z.std((-1), keepdims=True) * corr_std
         )
 
-        keep_alive = q_hat < 0.0  # TODO threshold as hparam?
+        keep_alive = q_hat < 0.0
         alive = alive & (keep_alive | (step < min_steps))
 
         return (step + 1, model, opt, y, z, alive, rngs), (
@@ -320,7 +325,7 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             "train/x_prenorm_scale": model.net.x_norm.scale.mean(),
             "train/y_prenorm_scale": model.net.y_norm.scale.mean(),
             "train/z_prenorm_scale": model.net.z_norm.scale.mean(),
-            **pred_metrics(y_hats, y_true, prefix="train")[0],
+            **pred_metrics(y_hats, y_true, prefix="train"),
         },
     )
 
@@ -339,7 +344,7 @@ def eval_step(model, batch, config, rngs):
     )
     train_N = config.N_supervision if effective_N > config.N_supervision else None
     metrics, cell_acc, solved_acc = pred_metrics(
-        y_hats, y_true, prefix="eval", train_N=train_N
+        y_hats, y_true, prefix="eval", train_N=train_N, return_curves=True
     )
     return {
         **metrics,
@@ -432,23 +437,6 @@ def asymptotic_alignment_score(model, batch, config, rngs):
     }
 
 
-def calc_metric_over_batches(metric_fn, data_iter, mesh=None, num_batches=100):
-    """Generic function to calculate metrics over multiple batches and average."""
-    totals = defaultdict(float)
-
-    for i, batch in enumerate(data_iter):
-        if i >= num_batches:
-            break
-        if mesh is not None:
-            batch = shard_batch(batch)
-
-        metrics = metric_fn(batch)
-        for k, v in metrics.items():
-            totals[k] += v
-
-    return {k: v / num_batches for k, v in totals.items()}
-
-
 def model_factory(config, param_dtype, compute_dtype, rngs):
     Linear = partial(
         nnx.Linear, dtype=compute_dtype, param_dtype=param_dtype, rngs=rngs
@@ -480,14 +468,6 @@ def model_factory(config, param_dtype, compute_dtype, rngs):
     )
 
     return model, decay_mask
-
-
-def shard_batch(batch):
-    # data parallel sharding
-    return {
-        "inputs": jax.device_put(batch["inputs"], P("data", None)),
-        "labels": jax.device_put(batch["labels"], P("data", None)),
-    }
 
 
 @dataclass(frozen=True)
