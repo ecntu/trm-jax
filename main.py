@@ -390,13 +390,21 @@ def asymptotic_alignment_score(model, batch, config, rngs):
     model.eval()
     x_input = batch["inputs"]
 
+    # for hidden states
     def cos_sim(a, b):
         a, b = rearrange(a, "b ... -> b (...)"), rearrange(b, "b ... -> b (...)")
         return (a * b).sum(-1) / (
             jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
-        )
+        ).clip(min=1e-8)
 
-    _, (y1, z1) = model.predict(
+    # for logits
+    def tokenwise_cos_sim(a, b):
+        a, b = rearrange(a, "b l c -> b l c"), rearrange(b, "b l c -> b l c")
+        return (a * b).sum(-1) / (
+            jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
+        ).clip(min=1e-8)
+
+    y_hats1, (y1, z1) = model.predict(
         x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
     )
 
@@ -404,7 +412,7 @@ def asymptotic_alignment_score(model, batch, config, rngs):
     y1_shifted = jnp.roll(y1, shift=1, axis=0)
     z1_shifted = jnp.roll(z1, shift=1, axis=0)
 
-    _, (y2, z2) = model.predict(
+    y_hats2, (y2, z2) = model.predict(
         x_input,
         y=y1_shifted,
         z=z1_shifted,
@@ -414,9 +422,13 @@ def asymptotic_alignment_score(model, batch, config, rngs):
         rngs=rngs,
     )
 
+    pred_match = (y_hats1[-1].argmax(axis=-1) == y_hats2[-1].argmax(axis=-1)).mean()
+
     return {
-        "asymptotic_alignment/y_cos_sim": cos_sim(y1, y2).mean(),
-        "asymptotic_alignment/z_cos_sim": cos_sim(z1, z2).mean(),
+        "asymp_align/pred_match": pred_match,
+        "asymp_align/y_cos_sim": cos_sim(y1, y2).mean(),
+        "asymp_align/z_cos_sim": cos_sim(z1, z2).mean(),
+        "asymp_align/y_hat_cos_sim": tokenwise_cos_sim(y_hats1[-1], y_hats2[-1]).mean(),
     }
 
 
