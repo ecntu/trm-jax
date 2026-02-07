@@ -12,7 +12,9 @@ uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --seed 0 \
 uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --eval_only --N_supervision_eval_mult 32.0
 ```
 
-currently yields this run ([checkpoint](https://huggingface.co/emiliocantuc/trm-vanilla-2)):
+currently yields this run ([checkpoint](https://huggingface.co/emiliocantuc/trm-vanilla-2)), which displays test-time scaling. I.e. after training we measure % of sudoku puzzles solved (right plot below) as we increase supervision steps $N_\text{sup}$:
+
+<img width="815" height="432" alt="Screenshot 2026-02-07 at 6 43 14 PM" src="https://github.com/user-attachments/assets/a0745502-e905-4c18-b51f-8543dd6e23c5" />
 
 
 ### Todo
