@@ -5,12 +5,14 @@ Thanks to the [TPU Research Cloud](https://sites.research.google/trc/about/) pro
 Running with 
 
 ```bash
-uv run --with jax\[tpu\] main.py --workdir logs/run_name
+uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --seed 0 \
+	--max_checkpoints 1 --N_supervision_eval_mult 2.0
+
+# loads best checkpoint and evals up to 16*32 = 512
+uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --eval_only --N_supervision_eval_mult 32.0
 ```
 
-currently yields this run and [checkpoint](https://huggingface.co/emiliocantuc/trm_test):
-
-<img width="1256" height="428" alt="Screenshot 2026-01-20 at 9 19 44 AM" src="https://github.com/user-attachments/assets/52d83aaf-4794-4879-a6b2-85a15d0f97e9" />
+currently yields this run ([checkpoint](https://huggingface.co/emiliocantuc/trm-vanilla-2)):
 
 
 ### Todo
