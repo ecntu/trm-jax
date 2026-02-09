@@ -18,6 +18,7 @@ currently yields this run ([checkpoint](https://huggingface.co/emiliocantuc/trm-
 
 
 ### Todo
+- [ ] make val set more representative of test
 - [ ] update new checkpoints and results w/test-time scaling curves
 - [ ] small runs with test-time aug (rand init state + bigger N_sups)
 
