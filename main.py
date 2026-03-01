@@ -471,6 +471,7 @@ def model_factory(config, param_dtype, compute_dtype, rngs):
         init_z=InitState(config.init_state, config.h_dim, rngs=rngs),
     )
 
+    # TODO get rid of this? test if actually helps
     decay_mask = nnx.state(model, nnx.Param).map(
         lambda path, p: (p.ndim >= 2) and ("embedding" not in path)
     )
