@@ -19,6 +19,7 @@ from collections import defaultdict
 from absl import logging
 from clu import metric_writers, periodic_actions
 import simple_parsing
+from typing import Literal
 
 from datasets import load_dataset
 from utils import (
@@ -76,7 +77,7 @@ class TRM(nnx.Module):
         y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
         return (y, z), self.output_head(y), self.Q_head(y)
 
-    def predict(self, x_input, y=None, z=None, N_supervision=16, n=6, T=3, rngs=None):
+    def predict(self, x_input, y=None, z=None, N_sup=16, n=6, T=3, rngs=None):
         x = self.input_embedding(x_input)
         batch_size, seq_len, _ = x.shape
 
@@ -92,7 +93,7 @@ class TRM(nnx.Module):
             return (y, z), y_hat
 
         (ys, zs), y_hats = lax.scan(
-            supervision_step, (y, z), None, length=N_supervision
+            supervision_step, (y, z), None, length=N_sup
         )
         return y_hats, (ys, zs)
 
@@ -175,8 +176,8 @@ class InitState(nnx.Module):
         return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
 
 
-def loss_fn(model, x, y, z, y_true, alive, config, T):
-    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=config.n, T=T)
+def loss_fn(model, x, y, z, y_true, alive, cfg, T):
+    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=cfg.n, T=T)
 
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
     alive = alive.astype(jnp.float32)
@@ -200,7 +201,7 @@ def loss_fn(model, x, y, z, y_true, alive, config, T):
         rearrange(binary_ce(logits=q_hat, labels=should_halt), "b 1 -> b 1") * alive
     ).sum() / total_alive
 
-    loss = rec_loss + config.halt_loss_weight * halt_loss
+    loss = rec_loss + cfg.halt_loss_weight * halt_loss
     return loss, (y, z, y_hat, q_hat)
 
 
@@ -232,8 +233,8 @@ def pred_metrics(preds, y_true, prefix, train_N=None, return_curves=False):
         return metrics
 
 
-@nnx.jit(static_argnames=("config",))
-def train_step(model, ema_model, opt, batch, config, rngs):
+@nnx.jit(static_argnames=("cfg",))
+def train_step(model, ema_model, opt, batch, cfg, rngs):
     model.train()
 
     x_input, y_true = batch["inputs"], batch["labels"]
@@ -245,32 +246,32 @@ def train_step(model, ema_model, opt, batch, config, rngs):
         model.init_z(bs, seq_len, rngs),
     )
 
-    if config.random_T:
-        T = jax.random.randint(rngs(), shape=(), minval=1, maxval=config.T + 1)
+    if cfg.rand_T:
+        T = jax.random.randint(rngs(), shape=(), minval=1, maxval=cfg.T + 1)
     else:
-        T = config.T
+        T = cfg.T
 
     min_steps = (
-        jax.random.uniform(rngs(), (bs, 1)) <= config.halt_exploration_prob
-    ) * jax.random.randint(rngs(), (bs, 1), 2, config.N_supervision + 1)
+        jax.random.uniform(rngs(), (bs, 1)) <= cfg.halt_exploration_prob
+    ) * jax.random.randint(rngs(), (bs, 1), 2, cfg.N_sup + 1)
 
     def sup_step(carry, _):
         step, model, opt, y_in, z_in, alive, rngs = carry
 
         # update step
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y_in, z_in, y_true, alive, config, T
+            model, x, y_in, z_in, y_true, alive, cfg, T
         )
         opt.update(model, grads)
 
-        if config.stay_on_policy:
-            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=config.n, T=T)
+        if cfg.stay_on_policy:
+            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=cfg.n, T=T)
 
         # add noise to latents (new) TODO mess with std shape
         corr_std = (
-            (jax.random.uniform(rngs(), (bs, 1, 1)) >= config.corruption_clean_prop)
+            (jax.random.uniform(rngs(), (bs, 1, 1)) >= cfg.corruption_clean_prop)
             * jax.random.uniform(rngs(), (bs, 1, 1))
-            * config.max_corruption_std
+            * cfg.max_corruption_std
         )
         y = (
             y
@@ -298,11 +299,11 @@ def train_step(model, ema_model, opt, batch, config, rngs):
             sup_step,
             (1, model, opt, y, z, alive, rngs),
             None,
-            length=config.N_supervision,
+            length=cfg.N_sup,
         )
     )
     new_ema_model = optax.incremental_update(
-        model, ema_model, step_size=1 - config.ema_beta
+        model, ema_model, step_size=1 - cfg.ema_beta
     )
 
     return (
@@ -312,11 +313,11 @@ def train_step(model, ema_model, opt, batch, config, rngs):
         {
             "train/loss": losses[-1],
             "train/loss_first_delta": losses[-1] - losses[0],
-            "train/loss_halfway_delta": losses[-1] - losses[config.N_supervision // 2],
+            "train/loss_halfway_delta": losses[-1] - losses[cfg.N_sup // 2],
             "train/loss_std": jnp.std(losses),
             "train/prop_alive": props_alive[-1],
             "train/prop_alive_first": props_alive[0],
-            "train/prop_alive_halfway": props_alive[config.N_supervision // 2],
+            "train/prop_alive_halfway": props_alive[cfg.N_sup // 2],
             "train/grad_norm": norms[-1],
             "train/logit_mean": jnp.abs(y_hats[-1]).mean(),
             "train/logit_std": jnp.std(y_hats[-1]),
@@ -329,41 +330,40 @@ def train_step(model, ema_model, opt, batch, config, rngs):
     )
 
 
-@nnx.jit(static_argnames=("config",))
-def eval_step(model, batch, config, rngs):
+# TODO fix
+@nnx.jit(static_argnames=("cfg",))
+def eval_step(model, batch, cfg, rngs):
     model.eval()
     x_input, y_true = batch["inputs"], batch["labels"]
-    effective_N = int(config.N_supervision * config.N_supervision_eval_mult)
-    keys = jax.random.split(rngs(), config.eval_k)
+    keys = jax.random.split(rngs(), cfg.test_k)
 
     def one_pred(key):
         run_rngs = nnx.Rngs(key)
         y_hats, _ = model.predict(
             x_input,
-            N_supervision=effective_N,
-            n=config.n,
-            T=config.T,
+            N_sup=cfg.N_sup_test,
+            n=cfg.n,
+            T=cfg.T,
             rngs=run_rngs,
         )
         return y_hats.argmax(axis=-1)
 
     k_preds = jax.vmap(one_pred)(keys)  # (k, n, b, l)
-    preds = jnp.argmax(jax.nn.one_hot(k_preds, config.vocab_size).sum(axis=0), axis=-1)
+    preds = jnp.argmax(jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1)
 
-    train_N = config.N_supervision if effective_N > config.N_supervision else None
+    train_N = cfg.N_sup if cfg.N_sup_test > cfg.N_sup else None
     metrics, cell_acc, solved_acc = pred_metrics(
         preds, y_true, prefix="eval", train_N=train_N, return_curves=True
     )
     return {
         **metrics,
-        "eval/effective_N_supervision": effective_N,
         "cell_acc_per_step": cell_acc,
         "solved_acc_per_step": solved_acc,
         "batch_size": x_input.shape[0],
     }
 
 
-def evaluate_epoch(model, data_iter, config, rngs, mesh=None, log_curves=False):
+def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
     totals = defaultdict(float)
     total_weight = 0.0
     all_cell_acc_steps = []
@@ -372,7 +372,7 @@ def evaluate_epoch(model, data_iter, config, rngs, mesh=None, log_curves=False):
     for batch in data_iter:
         if mesh is not None:
             batch = shard_batch(batch)
-        metrics = eval_step(model, batch, config, rngs)
+        metrics = eval_step(model, batch, cfg, rngs)
         bs = float(metrics.pop("batch_size"))
 
         if log_curves:
@@ -397,8 +397,8 @@ def evaluate_epoch(model, data_iter, config, rngs, mesh=None, log_curves=False):
     return results
 
 
-@nnx.jit(static_argnames=("config",))
-def asymptotic_alignment_score(model, batch, config, rngs):
+@nnx.jit(static_argnames=("cfg",))
+def asymptotic_alignment_score(model, batch, cfg, rngs):
     """arxiv:2211.09961"""
     model.eval()
     x_input = batch["inputs"]
@@ -418,7 +418,7 @@ def asymptotic_alignment_score(model, batch, config, rngs):
         ).clip(min=1e-8)
 
     y_hats1, (y1, z1) = model.predict(
-        x_input, N_supervision=config.N_supervision, n=config.n, T=config.T, rngs=rngs
+        x_input, N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
     )
 
     # Shift y1 and z1 down by 1 to use hidden states from other examples in the batch
@@ -429,9 +429,9 @@ def asymptotic_alignment_score(model, batch, config, rngs):
         x_input,
         y=y1_shifted,
         z=z1_shifted,
-        N_supervision=config.N_supervision,
-        n=config.n,
-        T=config.T,
+        N_sup=cfg.N_sup,
+        n=cfg.n,
+        T=cfg.T,
         rngs=rngs,
     )
 
@@ -445,30 +445,30 @@ def asymptotic_alignment_score(model, batch, config, rngs):
     }
 
 
-def model_factory(config, param_dtype, compute_dtype, rngs):
+def model_factory(cfg, param_dtype, compute_dtype, rngs):
     Linear = partial(
         nnx.Linear, dtype=compute_dtype, param_dtype=param_dtype, rngs=rngs
     )
 
     model = TRM(
         net=Net(
-            config.seq_len,
-            config.h_dim,
-            expansion=config.mlp_factor,
-            n_layers=config.n_layers,
+            cfg.seq_len,
+            cfg.h_dim,
+            expansion=cfg.mlp_factor,
+            n_layers=cfg.n_layers,
             linear=Linear,
             rngs=rngs,
         ),
-        output_head=Linear(config.h_dim, config.vocab_size),
+        output_head=Linear(cfg.h_dim, cfg.vocab_size),
         Q_head=nnx.Sequential(
             partial(reduce, pattern="b l h -> b h", reduction="mean"),
-            Linear(config.h_dim, 1),
+            Linear(cfg.h_dim, 1),
         ),
         input_embedding=nnx.Embed(
-            config.vocab_size, config.h_dim, param_dtype=param_dtype, rngs=rngs
+            cfg.vocab_size, cfg.h_dim, param_dtype=param_dtype, rngs=rngs
         ),
-        init_y=InitState(config.init_state, config.h_dim, rngs=rngs),
-        init_z=InitState(config.init_state, config.h_dim, rngs=rngs),
+        init_y=InitState(cfg.init_state, cfg.h_dim, rngs=rngs),
+        init_z=InitState(cfg.init_state, cfg.h_dim, rngs=rngs),
     )
 
     # TODO get rid of this? test if actually helps
@@ -480,7 +480,7 @@ def model_factory(config, param_dtype, compute_dtype, rngs):
 
 
 @dataclass(frozen=True)
-class Config:
+class cfg:
     dataset: str = "emiliocantuc/sudoku-extreme-1k-aug-1000"
     seq_len: int = 81
     vocab_size: int = 10
@@ -490,10 +490,12 @@ class Config:
     mlp_factor: int = 4
     init_state: str = "static"
 
-    N_supervision: int = 16
+    N_sup: int = 16
     n: int = 6
     T: int = 3
-    random_T: bool = False
+    rand_n: bool = False # TODO
+    rand_T: bool = False
+
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
     max_corruption_std: float = 0.0
@@ -505,34 +507,37 @@ class Config:
     lr_warmup_steps: int = 2000 // 16
     weight_decay: float = 1.0
     ema_beta: float = 0.999**16
-    steps: int = 15_000
-
-    eval_only: bool = False
-    run_final_eval: bool = False
-    N_supervision_eval_mult: float = 1.0
-    eval_k: int = 1
-
     half_precision: bool = False
+    steps: int = 15_000
     val_every: int = 500
-    workdir: str = None
-    test_subset_size: int = 0
+
+    test_only: bool = False
+    skip_test: bool = False
+    test_size: int | None = None
+    N_sup_test: int | None = None
+    test_k: int = 1
+    test_k_mode: Literal["conf", "mode"] = "conf"
+
     seed: int = None
+    data_seed: int = 42 # TODO
+    workdir: str = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
     use_parallel: bool = True
 
 
 if __name__ == "__main__":
-    config = simple_parsing.parse(Config)
+    cfg = simple_parsing.parse(cfg)
+    cfg.N_sup_test = cfg.N_sup_test or int(cfg.N_sup * 4)
 
     tpu = jax.default_backend() == "tpu"
     param_dtype = jnp.float32
-    compute_dtype = jnp.bfloat16 if tpu and config.half_precision else jnp.float32
+    compute_dtype = jnp.bfloat16 if tpu and cfg.half_precision else jnp.float32
 
-    seed = config.seed or random.randint(0, 2**32 - 1)
+    seed = cfg.seed or random.randint(0, 2**32 - 1)
 
     # Enable XLA determinism only when explicit seed is provided
-    if config.seed is not None:
+    if cfg.seed is not None:
         os.environ["XLA_FLAGS"] = (
             os.environ.get("XLA_FLAGS", "")
             + " --xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0"
@@ -541,7 +546,7 @@ if __name__ == "__main__":
     rngs = nnx.Rngs(seed)
 
     num_devices = jax.device_count()
-    if config.use_parallel and num_devices > 1:
+    if cfg.use_parallel and num_devices > 1:
         mesh = jax.make_mesh((num_devices,), ("data",))
         nnx.use_eager_sharding(True)
     else:
@@ -549,28 +554,28 @@ if __name__ == "__main__":
         nnx.use_eager_sharding(False)
     print(f"Using mesh: {mesh}")
 
-    train_ds = load_dataset(config.dataset, split="train")
-    # train_ds = load_dataset(config.dataset, split=f"train[:{config.batch_size}]") # debug by overfitting to single batch
-    val_ds = load_dataset(config.dataset, split="test[:1024]")
-    test_ds = load_dataset(config.dataset, split="test")
-    if config.test_subset_size:
-        test_ds = test_ds.shuffle(seed=seed).select(range(config.test_subset_size))
+    train_ds = load_dataset(cfg.dataset, split="train")
+    # train_ds = load_dataset(cfg.dataset, split=f"train[:{cfg.batch_size}]") # debug by overfitting to single batch
+    val_ds = load_dataset(cfg.dataset, split="test[:1024]")
+    test_ds = load_dataset(cfg.dataset, split="test")
+    if cfg.test_subset_size:
+        test_ds = test_ds.shuffle(seed=seed).select(range(cfg.test_subset_size))
 
-    train_loader = Loader(train_ds, batch_size=config.batch_size, shuffle_seed=seed)
-    val_loader = Loader(val_ds, batch_size=config.batch_size, epochs=1)
-    test_loader = Loader(test_ds, batch_size=config.batch_size, epochs=1)
+    train_loader = Loader(train_ds, batch_size=cfg.batch_size, shuffle_seed=seed)
+    val_loader = Loader(val_ds, batch_size=cfg.batch_size, epochs=1)
+    test_loader = Loader(test_ds, batch_size=cfg.batch_size, epochs=1)
 
     mesh_ctx = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
 
     with mesh_ctx:
-        model, decay_mask = model_factory(config, param_dtype, compute_dtype, rngs)
+        model, decay_mask = model_factory(cfg, param_dtype, compute_dtype, rngs)
         n_params = sum(
             jax.tree.map(jnp.size, jax.tree.leaves(nnx.state(model, nnx.Param)))
         )
         print(f"No. of parameters: {n_params}")
 
         lr_schedule = optax.warmup_constant_schedule(
-            init_value=0.0, peak_value=config.lr, warmup_steps=config.lr_warmup_steps
+            init_value=0.0, peak_value=cfg.lr, warmup_steps=cfg.lr_warmup_steps
         )
 
         opt = nnx.Optimizer(
@@ -581,8 +586,8 @@ if __name__ == "__main__":
                     learning_rate=lr_schedule,
                     b1=0.9,
                     b2=0.95,
-                    eps=1e-4 if config.half_precision else 1e-8,
-                    weight_decay=config.weight_decay,
+                    eps=1e-4 if cfg.half_precision else 1e-8,
+                    weight_decay=cfg.weight_decay,
                     mask=decay_mask,
                 ),
             ),
@@ -592,30 +597,30 @@ if __name__ == "__main__":
         ema_model = nnx.clone(model)
 
         checkpoint_manager = None
-        if config.workdir is not None and (
-            config.max_checkpoints > 0 or config.eval_only
+        if cfg.workdir is not None and (
+            cfg.max_checkpoints > 0 or cfg.test_only
         ):
             checkpoint_manager = ocp.CheckpointManager(
-                config.workdir
-                if config.workdir.startswith("gs://")
-                else os.path.abspath(config.workdir),
+                cfg.workdir
+                if cfg.workdir.startswith("gs://")
+                else os.path.abspath(cfg.workdir),
                 options=ocp.CheckpointManagerOptions(
                     best_mode="max",
                     best_fn=lambda m: m["eval/solved_acc"],
-                    max_to_keep=config.max_checkpoints,
+                    max_to_keep=cfg.max_checkpoints,
                 ),
             )
 
         # logging
         writer = metric_writers.create_default_writer(
-            config.workdir, just_logging=jax.process_index() > 0
+            cfg.workdir, just_logging=jax.process_index() > 0
         )
-        writer.write_hparams(vars(config))
+        writer.write_hparams(vars(cfg))
         writer.write_scalars(0, {"hparams/n_params": n_params})
 
         # restore
         restore_items = (
-            ("ema_model",) if config.eval_only else ("model", "opt", "ema_model")
+            ("ema_model",) if cfg.test_only else ("model", "opt", "ema_model")
         )
         start_step = restore_checkpoint(
             checkpoint_manager, model, opt, ema_model, items=restore_items
@@ -625,14 +630,14 @@ if __name__ == "__main__":
         last_eval_metrics = {"metrics": None}
 
         def _val_callback(step, t):
-            m = evaluate_epoch(ema_model, val_loader, config, rngs, mesh)
+            m = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh)
             last_eval_metrics["metrics"] = m
             writer.write_scalars(step, m)
 
         def _run_test():
             logging.info("Running test evaluation...")
             test_metrics = evaluate_epoch(
-                ema_model, test_loader, config, rngs, mesh, log_curves=True
+                ema_model, test_loader, cfg, rngs, mesh, log_curves=True
             )
 
             curve_cell_acc = test_metrics.pop("_curve_cell_acc", None)
@@ -668,20 +673,20 @@ if __name__ == "__main__":
 
         hooks = [
             periodic_actions.ReportProgress(
-                num_train_steps=config.steps, writer=writer
+                num_train_steps=cfg.steps, writer=writer
             ),
             periodic_actions.PeriodicCallback(
-                every_steps=config.val_every,
-                on_steps=[config.steps],
+                every_steps=cfg.val_every,
+                on_steps=[cfg.steps],
                 callback_fn=_val_callback,
             ),
             periodic_actions.PeriodicCallback(
-                every_steps=config.val_every,
+                every_steps=cfg.val_every,
                 callback_fn=lambda step, t: writer.write_scalars(
                     step,
                     calc_metric_over_batches(
                         lambda batch: asymptotic_alignment_score(
-                            ema_model, batch, config, rngs
+                            ema_model, batch, cfg, rngs
                         ),
                         iter(val_loader),
                         mesh,
@@ -692,31 +697,31 @@ if __name__ == "__main__":
         if checkpoint_manager is not None:
             hooks.append(
                 periodic_actions.PeriodicCallback(
-                    every_steps=config.checkpoint_every,
-                    on_steps=[config.steps],
+                    every_steps=cfg.checkpoint_every,
+                    on_steps=[cfg.steps],
                     callback_fn=_checkpoint_callback,
                 )
             )
-        if config.workdir is not None and jax.process_index() == 0:
+        if cfg.workdir is not None and jax.process_index() == 0:
             hooks.append(
-                periodic_actions.Profile(num_profile_steps=5, logdir=config.workdir)
+                periodic_actions.Profile(num_profile_steps=5, logdir=cfg.workdir)
             )
 
-        if config.eval_only:
+        if cfg.test_only:
             restored_step = start_step - 1
             if restored_step <= 0:
                 logging.error(
-                    "No checkpoint found for eval_only run. Provide a workdir with a checkpoint."
+                    "No checkpoint found for test_only run. Provide a workdir with a checkpoint."
                 )
                 exit(1)
             _run_test()
             exit(0)
 
-        if start_step > config.steps:
+        if start_step > cfg.steps:
             logging.info(
-                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({config.steps}); evaluating."
+                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({cfg.steps}); evaluating."
             )
-            if config.run_final_eval:
+            if not cfg.skip_test:
                 _run_test()
             exit(0)
 
@@ -725,7 +730,7 @@ if __name__ == "__main__":
                 if mesh is not None:
                     batch = shard_batch(batch)
                 model, opt, ema_model, train_metrics = train_step(
-                    model, ema_model, opt, batch, config, rngs
+                    model, ema_model, opt, batch, cfg, rngs
                 )
                 train_metrics["train/lr"] = lr_schedule(step)
                 writer.write_scalars(step, train_metrics)
@@ -733,10 +738,10 @@ if __name__ == "__main__":
                 for h in hooks:
                     h(step)
 
-                if step >= config.steps:
+                if step >= cfg.steps:
                     break
 
-            if config.run_final_eval:
+            if not cfg.skip_test:
                 _run_test()
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()

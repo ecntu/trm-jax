@@ -6,10 +6,10 @@ Running with
 
 ```bash
 uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --seed 0 \
-	--max_checkpoints 1 --N_supervision_eval_mult 2.0
+	--max_checkpoints 1 --N_sup_eval_mult 2.0
 
 # loads best checkpoint and evals up to 16*32 = 512
-uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --eval_only --N_supervision_eval_mult 32.0
+uv run --with jax\[tpu\] main.py --workdir "logs/vanilla" --eval_only --N_sup_eval_mult 32.0
 ```
 
 currently yields this run ([checkpoint](https://huggingface.co/emiliocantuc/trm-vanilla-2)), which displays test-time scaling. I.e. after training we measure % of sudoku puzzles solved (right plot below) as we increase supervision steps $N_\text{sup}$:
