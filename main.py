@@ -330,7 +330,7 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
     )
 
 
-# TODO fix
+# TODO check k_passes and add "conf" mode
 @nnx.jit(static_argnames=("cfg",))
 def eval_step(model, batch, cfg, rngs):
     model.eval()
@@ -520,7 +520,7 @@ class cfg:
     test_k_mode: Literal["conf", "mode"] = "conf"
 
     seed: int = None
-    data_seed: int = 42 # TODO
+    data_seed: int = 42
     workdir: str = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
@@ -531,7 +531,7 @@ if __name__ == "__main__":
     cfg = simple_parsing.parse(cfg)
     tpu = jax.default_backend() == "tpu"
     param_dtype = jnp.float32
-    compute_dtype = jnp.bfloat16 if tpu and cfg.half_precision else jnp.float32
+    compute_dtype = jnp.bfloat16 if tpu and cfg.half_precision else jnp.float32 # TODO test if ever stable, else delete
 
     seed = cfg.seed or random.randint(0, 2**32 - 1)
     if cfg.seed is not None: # only when seed explicitly provided
