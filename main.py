@@ -542,13 +542,9 @@ if __name__ == "__main__":
     rngs = nnx.Rngs(seed)
 
     num_devices = jax.device_count()
-    if cfg.use_parallel and num_devices > 1:
-        mesh = jax.make_mesh((num_devices,), ("data",))
-        nnx.use_eager_sharding(True)
-    else:
-        mesh = None
-        nnx.use_eager_sharding(False)
-    print(f"Using mesh: {mesh}")
+    mesh = jax.make_mesh((num_devices,), ("data",)) if cfg.use_parallel and num_devices > 1 else None
+    nnx.use_eager_sharding(mesh is not None)
+    logging.info(f"Using mesh: {mesh}")
 
     ds = load_dataset(cfg.dataset)
     val_test = ds["test"].train_test_split(train_size=cfg.val_size, seed=cfg.data_seed)
@@ -560,15 +556,12 @@ if __name__ == "__main__":
     val_loader = Loader(val_ds, batch_size=cfg.batch_size, epochs=1)
     test_loader = Loader(test_ds, batch_size=cfg.batch_size, epochs=1)
 
-
-    mesh_ctx = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
-
-    with mesh_ctx:
+    with jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext():
         model, decay_mask = model_factory(cfg, param_dtype, compute_dtype, rngs)
         n_params = sum(
             jax.tree.map(jnp.size, jax.tree.leaves(nnx.state(model, nnx.Param)))
         )
-        print(f"No. of parameters: {n_params}")
+        logging.info(f"No. of parameters: {n_params}")
 
         lr_schedule = optax.warmup_constant_schedule(
             init_value=0.0, peak_value=cfg.lr, warmup_steps=cfg.lr_warmup_steps
@@ -607,14 +600,12 @@ if __name__ == "__main__":
                 ),
             )
 
-        # logging
         writer = metric_writers.create_default_writer(
             cfg.workdir, just_logging=jax.process_index() > 0
         )
         writer.write_hparams(vars(cfg))
         writer.write_scalars(0, {"hparams/n_params": n_params})
 
-        # restore
         restore_items = (
             ("ema_model",) if cfg.test_only else ("model", "opt", "ema_model")
         )
@@ -622,16 +613,8 @@ if __name__ == "__main__":
             checkpoint_manager, model, opt, ema_model, items=restore_items
         )
 
-        # some callbacks
-        last_eval_metrics = {"metrics": None}
-
-        def _val_callback(step, t):
-            m = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh)
-            last_eval_metrics["metrics"] = m
-            writer.write_scalars(step, m)
-
         def _run_test():
-            logging.info("Running test evaluation...")
+            logging.info("Testing ...")
             test_metrics = evaluate_epoch(
                 ema_model, test_loader, cfg, rngs, mesh, log_curves=True
             )
@@ -655,7 +638,25 @@ if __name__ == "__main__":
                     )
             logging.info(f"Test metrics: {test_metrics}")
 
-        def _checkpoint_callback(step, t):
+        if cfg.test_only and start_step <= 1:
+            logging.error("No checkpoint found for test_only run.")
+            exit(1)
+        elif start_step > cfg.steps:
+            logging.info(f"Loaded step {start_step-1} already exceeds total {cfg.steps}.")
+            if not cfg.skip_test:
+                _run_test()
+            exit(0)
+        elif cfg.test_only:
+            _run_test()
+            exit(0)
+
+        last_eval_metrics = {"metrics": None}
+        def _run_val(step, t):
+            m = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh)
+            last_eval_metrics["metrics"] = m
+            writer.write_scalars(step, m)
+
+        def _save_checkpoint(step, t):
             if last_eval_metrics["metrics"] is None:
                 return
             save_checkpoint(
@@ -674,7 +675,7 @@ if __name__ == "__main__":
             periodic_actions.PeriodicCallback(
                 every_steps=cfg.val_every,
                 on_steps=[cfg.steps],
-                callback_fn=_val_callback,
+                callback_fn=_run_val,
             ),
             periodic_actions.PeriodicCallback(
                 every_steps=cfg.val_every,
@@ -695,31 +696,13 @@ if __name__ == "__main__":
                 periodic_actions.PeriodicCallback(
                     every_steps=cfg.checkpoint_every,
                     on_steps=[cfg.steps],
-                    callback_fn=_checkpoint_callback,
+                    callback_fn=_save_checkpoint,
                 )
             )
         if cfg.workdir is not None and jax.process_index() == 0:
             hooks.append(
                 periodic_actions.Profile(num_profile_steps=5, logdir=cfg.workdir)
             )
-
-        if cfg.test_only:
-            restored_step = start_step - 1
-            if restored_step <= 0:
-                logging.error(
-                    "No checkpoint found for test_only run. Provide a workdir with a checkpoint."
-                )
-                exit(1)
-            _run_test()
-            exit(0)
-
-        if start_step > cfg.steps:
-            logging.info(
-                f"Latest checkpoint ({start_step - 1}) already meets or exceeds target steps ({cfg.steps}); evaluating."
-            )
-            if not cfg.skip_test:
-                _run_test()
-            exit(0)
 
         with metric_writers.ensure_flushes(writer):
             for step, batch in enumerate(train_loader, start=start_step):
