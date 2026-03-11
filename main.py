@@ -510,11 +510,12 @@ class cfg:
     half_precision: bool = False
     steps: int = 15_000
     val_every: int = 500
+    val_size: int = 2048
 
     test_only: bool = False
     skip_test: bool = False
     test_size: int | None = None
-    N_sup_test: int | None = None
+    N_sup_test: int = 16 * 4
     test_k: int = 1
     test_k_mode: Literal["conf", "mode"] = "conf"
 
@@ -528,21 +529,16 @@ class cfg:
 
 if __name__ == "__main__":
     cfg = simple_parsing.parse(cfg)
-    cfg.N_sup_test = cfg.N_sup_test or int(cfg.N_sup * 4)
-
     tpu = jax.default_backend() == "tpu"
     param_dtype = jnp.float32
     compute_dtype = jnp.bfloat16 if tpu and cfg.half_precision else jnp.float32
 
     seed = cfg.seed or random.randint(0, 2**32 - 1)
-
-    # Enable XLA determinism only when explicit seed is provided
-    if cfg.seed is not None:
+    if cfg.seed is not None: # only when seed explicitly provided
         os.environ["XLA_FLAGS"] = (
             os.environ.get("XLA_FLAGS", "")
             + " --xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0"
         )
-
     rngs = nnx.Rngs(seed)
 
     num_devices = jax.device_count()
@@ -554,16 +550,16 @@ if __name__ == "__main__":
         nnx.use_eager_sharding(False)
     print(f"Using mesh: {mesh}")
 
-    train_ds = load_dataset(cfg.dataset, split="train")
-    # train_ds = load_dataset(cfg.dataset, split=f"train[:{cfg.batch_size}]") # debug by overfitting to single batch
-    val_ds = load_dataset(cfg.dataset, split="test[:1024]")
-    test_ds = load_dataset(cfg.dataset, split="test")
-    if cfg.test_subset_size:
-        test_ds = test_ds.shuffle(seed=seed).select(range(cfg.test_subset_size))
+    ds = load_dataset(cfg.dataset)
+    val_test = ds["test"].train_test_split(train_size=cfg.val_size, seed=cfg.data_seed)
+    train_ds, val_ds, test_ds = ds["train"], val_test["train"], val_test["test"]
+    if cfg.test_size is not None:
+        test_ds = test_ds.shuffle(seed=cfg.data_seed).select(range(cfg.test_size))
 
     train_loader = Loader(train_ds, batch_size=cfg.batch_size, shuffle_seed=seed)
     val_loader = Loader(val_ds, batch_size=cfg.batch_size, epochs=1)
     test_loader = Loader(test_ds, batch_size=cfg.batch_size, epochs=1)
+
 
     mesh_ctx = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
 
