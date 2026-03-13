@@ -89,13 +89,13 @@ class TRM(nnx.Module):
 
         def supervision_step(carry, _):
             y, z = carry
-            (y, z), y_hat, _ = self(x=x, y=y, z=z, n=n, T=T)
-            return (y, z), y_hat
+            (y, z), y_hat, q_hat = self(x=x, y=y, z=z, n=n, T=T)
+            return (y, z), (y_hat, q_hat)
 
-        (ys, zs), y_hats = lax.scan(
+        (ys, zs), (y_hats, q_hats) = lax.scan(
             supervision_step, (y, z), None, length=N_sup
         )
-        return y_hats, (ys, zs)
+        return y_hats, q_hats, (ys, zs)
 
 
 def _find_multiple(a, b):
@@ -330,7 +330,6 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
     )
 
 
-# TODO check k_passes and add "conf" mode
 @nnx.jit(static_argnames=("cfg",))
 def eval_step(model, batch, cfg, rngs):
     model.eval()
@@ -339,17 +338,23 @@ def eval_step(model, batch, cfg, rngs):
 
     def one_pred(key):
         run_rngs = nnx.Rngs(key)
-        y_hats, _ = model.predict(
+        y_hats, q_hats, _ = model.predict(
             x_input,
             N_sup=cfg.N_sup_test,
             n=cfg.n,
             T=cfg.T,
             rngs=run_rngs,
         )
-        return y_hats.argmax(axis=-1)
+        return y_hats.argmax(axis=-1), q_hats
 
-    k_preds = jax.vmap(one_pred)(keys)  # (k, n, b, l)
-    preds = jnp.argmax(jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1)
+    k_preds, q_hats = jax.vmap(one_pred)(keys)
+    if cfg.test_k_mode == "conf":
+        preds = rearrange(
+            jnp.take_along_axis(k_preds, q_hats.argmax(axis=0, keepdims=True), axis=0),
+            "1 n b l -> n b l",
+        )
+    elif cfg.test_k_mode == "mode":
+        preds = jnp.argmax(jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1)
 
     train_N = cfg.N_sup if cfg.N_sup_test > cfg.N_sup else None
     metrics, cell_acc, solved_acc = pred_metrics(
@@ -417,7 +422,7 @@ def asymptotic_alignment_score(model, batch, cfg, rngs):
             jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
         ).clip(min=1e-8)
 
-    y_hats1, (y1, z1) = model.predict(
+    y_hats1, _, (y1, z1) = model.predict(
         x_input, N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
     )
 
@@ -425,7 +430,7 @@ def asymptotic_alignment_score(model, batch, cfg, rngs):
     y1_shifted = jnp.roll(y1, shift=1, axis=0)
     z1_shifted = jnp.roll(z1, shift=1, axis=0)
 
-    y_hats2, (y2, z2) = model.predict(
+    y_hats2, _, (y2, z2) = model.predict(
         x_input,
         y=y1_shifted,
         z=z1_shifted,
@@ -493,7 +498,7 @@ class cfg:
     N_sup: int = 16
     n: int = 6
     T: int = 3
-    rand_n: bool = False # TODO
+    rand_n: bool = False  # TODO
     rand_T: bool = False
 
     halt_loss_weight: float = 0.5
@@ -531,10 +536,12 @@ if __name__ == "__main__":
     cfg = simple_parsing.parse(cfg)
     tpu = jax.default_backend() == "tpu"
     param_dtype = jnp.float32
-    compute_dtype = jnp.bfloat16 if tpu and cfg.half_precision else jnp.float32 # TODO test if ever stable, else delete
+    compute_dtype = (
+        jnp.bfloat16 if tpu and cfg.half_precision else jnp.float32
+    )  # TODO test if ever stable, else delete
 
     seed = cfg.seed or random.randint(0, 2**32 - 1)
-    if cfg.seed is not None: # only when seed explicitly provided
+    if cfg.seed is not None:  # only when seed explicitly provided
         os.environ["XLA_FLAGS"] = (
             os.environ.get("XLA_FLAGS", "")
             + " --xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0"
@@ -542,7 +549,11 @@ if __name__ == "__main__":
     rngs = nnx.Rngs(seed)
 
     num_devices = jax.device_count()
-    mesh = jax.make_mesh((num_devices,), ("data",)) if cfg.use_parallel and num_devices > 1 else None
+    mesh = (
+        jax.make_mesh((num_devices,), ("data",))
+        if cfg.use_parallel and num_devices > 1
+        else None
+    )
     nnx.use_eager_sharding(mesh is not None)
     logging.info(f"Using mesh: {mesh}")
 
@@ -586,9 +597,7 @@ if __name__ == "__main__":
         ema_model = nnx.clone(model)
 
         checkpoint_manager = None
-        if cfg.workdir is not None and (
-            cfg.max_checkpoints > 0 or cfg.test_only
-        ):
+        if cfg.workdir is not None and (cfg.max_checkpoints > 0 or cfg.test_only):
             checkpoint_manager = ocp.CheckpointManager(
                 cfg.workdir
                 if cfg.workdir.startswith("gs://")
@@ -628,6 +637,7 @@ if __name__ == "__main__":
             writer.write_scalars(0, test_metrics)
 
             if curve_cell_acc is not None:
+                # TODO write curve as a CSV?
                 for i in range(len(curve_cell_acc)):
                     writer.write_scalars(
                         i + 1,
@@ -642,7 +652,9 @@ if __name__ == "__main__":
             logging.error("No checkpoint found for test_only run.")
             exit(1)
         elif start_step > cfg.steps:
-            logging.info(f"Loaded step {start_step-1} already exceeds total {cfg.steps}.")
+            logging.info(
+                f"Loaded step {start_step - 1} already exceeds total {cfg.steps}."
+            )
             if not cfg.skip_test:
                 _run_test()
             exit(0)
@@ -651,6 +663,7 @@ if __name__ == "__main__":
             exit(0)
 
         last_eval_metrics = {"metrics": None}
+
         def _run_val(step, t):
             m = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh)
             last_eval_metrics["metrics"] = m
@@ -669,9 +682,7 @@ if __name__ == "__main__":
             )
 
         hooks = [
-            periodic_actions.ReportProgress(
-                num_train_steps=cfg.steps, writer=writer
-            ),
+            periodic_actions.ReportProgress(num_train_steps=cfg.steps, writer=writer),
             periodic_actions.PeriodicCallback(
                 every_steps=cfg.val_every,
                 on_steps=[cfg.steps],
