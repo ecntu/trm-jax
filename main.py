@@ -399,39 +399,22 @@ def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
 @nnx.jit(static_argnames=("cfg",))
 def asymptotic_alignment_score(model, batch, cfg, rngs):
     """arxiv:2211.09961"""
-    model.eval()
-    x_input = batch["inputs"]
 
-    # for hidden states
     def cos_sim(a, b):
         a, b = rearrange(a, "b ... -> b (...)"), rearrange(b, "b ... -> b (...)")
         return (a * b).sum(-1) / (
             jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
         ).clip(min=1e-8)
 
-    # for logits
-    def tokenwise_cos_sim(a, b):
-        a, b = rearrange(a, "b l c -> b l c"), rearrange(b, "b l c -> b l c")
-        return (a * b).sum(-1) / (
-            jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
-        ).clip(min=1e-8)
-
+    model.eval()
     y_hats1, _, (y1, z1) = model.predict(
-        x_input, N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
+        batch["inputs"], N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
     )
 
-    # Shift y1 and z1 down by 1 to use hidden states from other examples in the batch
-    y1_shifted = jnp.roll(y1, shift=1, axis=0)
-    z1_shifted = jnp.roll(z1, shift=1, axis=0)
+    y1_s, z1_s = jnp.roll(y1, shift=1, axis=0), jnp.roll(z1, shift=1, axis=0)
 
     y_hats2, _, (y2, z2) = model.predict(
-        x_input,
-        y=y1_shifted,
-        z=z1_shifted,
-        N_sup=cfg.N_sup,
-        n=cfg.n,
-        T=cfg.T,
-        rngs=rngs,
+        batch["inputs"], y=y1_s, z=z1_s, N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
     )
 
     pred_match = (y_hats1[-1].argmax(axis=-1) == y_hats2[-1].argmax(axis=-1)).mean()
@@ -440,7 +423,6 @@ def asymptotic_alignment_score(model, batch, cfg, rngs):
         "asymp_align/pred_match": pred_match,
         "asymp_align/y_cos_sim": cos_sim(y1, y2).mean(),
         "asymp_align/z_cos_sim": cos_sim(z1, z2).mean(),
-        "asymp_align/y_hat_cos_sim": tokenwise_cos_sim(y_hats1[-1], y_hats2[-1]).mean(),
     }
 
 
