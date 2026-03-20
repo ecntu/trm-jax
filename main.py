@@ -19,7 +19,6 @@ from collections import defaultdict
 from absl import logging
 from clu import metric_writers, periodic_actions
 import simple_parsing
-from typing import Literal
 
 from datasets import load_dataset
 from utils import (
@@ -341,19 +340,38 @@ def eval_step(model, batch, cfg, rngs):
         )
         return y_hats.argmax(axis=-1), q_hats
 
-    k_preds, q_hats = jax.vmap(one_pred)(keys)
-    if cfg.test_k_mode == "conf":
-        preds = rearrange(
-            jnp.take_along_axis(k_preds, q_hats.argmax(axis=0, keepdims=True), axis=0),
-            "1 n b l -> n b l",
-        )
-    elif cfg.test_k_mode == "mode":
-        preds = jnp.argmax(jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1)
-
     train_N = cfg.N_sup if cfg.N_sup_test > cfg.N_sup else None
+    k_preds, q_hats = jax.vmap(one_pred)(keys)
+
+    preds = k_preds[0]
     metrics, cell_acc, solved_acc = pred_metrics(
         preds, y_true, prefix="eval", train_N=train_N, return_curves=True
     )
+
+    if cfg.test_k > 1:
+        conf_preds = rearrange(
+            jnp.take_along_axis(k_preds, q_hats.argmax(axis=0, keepdims=True), axis=0),
+            "1 n b l -> n b l",
+        )
+        mode_preds = jnp.argmax(
+            jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1
+        )
+        conf_metrics, conf_cell_acc, conf_solved_acc = pred_metrics(
+            conf_preds, y_true, prefix="eval_conf", train_N=train_N, return_curves=True
+        )
+        mode_metrics, mode_cell_acc, mode_solved_acc = pred_metrics(
+            mode_preds, y_true, prefix="eval_mode", train_N=train_N, return_curves=True
+        )
+        metrics = {
+            **metrics,
+            **conf_metrics,
+            **mode_metrics,
+            "cell_acc_per_step_conf": conf_cell_acc,
+            "solved_acc_per_step_conf": conf_solved_acc,
+            "cell_acc_per_step_mode": mode_cell_acc,
+            "solved_acc_per_step_mode": mode_solved_acc,
+        }
+
     return {
         **metrics,
         "cell_acc_per_step": cell_acc,
@@ -364,9 +382,8 @@ def eval_step(model, batch, cfg, rngs):
 
 def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
     totals = defaultdict(float)
+    all_curve_steps = defaultdict(list)
     total_weight = 0.0
-    all_cell_acc_steps = []
-    all_solved_acc_steps = []
 
     for batch in data_iter:
         if mesh is not None:
@@ -374,12 +391,11 @@ def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
         metrics = eval_step(model, batch, cfg, rngs)
         bs = float(metrics.pop("batch_size"))
 
-        if log_curves:
-            all_cell_acc_steps.append(metrics.pop("cell_acc_per_step") * bs)
-            all_solved_acc_steps.append(metrics.pop("solved_acc_per_step") * bs)
-        else:
-            metrics.pop("cell_acc_per_step", None)
-            metrics.pop("solved_acc_per_step", None)
+        for k in [k for k in metrics if "_per_step" in k]:
+            if log_curves:
+                all_curve_steps[k].append(metrics.pop(k) * bs)
+            else:
+                metrics.pop(k)
 
         for k, v in metrics.items():
             totals[k] += v * bs
@@ -388,10 +404,8 @@ def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
     results = {k: v / total_weight for k, v in totals.items()}
 
     if log_curves:
-        cell_acc_per_step = sum(all_cell_acc_steps) / total_weight
-        solved_acc_per_step = sum(all_solved_acc_steps) / total_weight
-        results["_curve_cell_acc"] = cell_acc_per_step
-        results["_curve_solved_acc"] = solved_acc_per_step
+        for k, arrays in all_curve_steps.items():
+            results[f"_curve_{k.replace('_per_step', '')}"] = sum(arrays) / total_weight
 
     return results
 
@@ -498,11 +512,11 @@ class cfg:
     test_size: int | None = None
     N_sup_test: int = 16 * 4
     test_k: int = 1
-    test_k_mode: Literal["conf", "mode"] = "conf"
 
     seed: int = None
     data_seed: int = 42
     workdir: str = None
+    logdir: str = None
     checkpoint_every: int = 500
     max_checkpoints: int = 1
     use_parallel: bool = True
@@ -586,7 +600,7 @@ if __name__ == "__main__":
             )
 
         writer = metric_writers.create_default_writer(
-            cfg.workdir, just_logging=jax.process_index() > 0
+            cfg.logdir or cfg.workdir, just_logging=jax.process_index() > 0
         )
         writer.write_hparams(vars(cfg))
         writer.write_scalars(0, {"hparams/n_params": n_params})
@@ -604,24 +618,17 @@ if __name__ == "__main__":
                 ema_model, test_loader, cfg, rngs, mesh, log_curves=True
             )
 
-            curve_cell_acc = test_metrics.pop("_curve_cell_acc", None)
-            curve_solved_acc = test_metrics.pop("_curve_solved_acc", None)
+            curves = {k: test_metrics.pop(k) for k in list(test_metrics) if k.startswith("_curve_")}
 
             test_metrics = {
                 k.replace("eval/", "test/"): v for k, v in test_metrics.items()
             }
             writer.write_scalars(0, test_metrics)
 
-            if curve_cell_acc is not None:
-                # TODO write curve as a CSV?
-                for i in range(len(curve_cell_acc)):
-                    writer.write_scalars(
-                        i + 1,
-                        {
-                            "test_curve/cell_acc": float(curve_cell_acc[i]),
-                            "test_curve/solved_acc": float(curve_solved_acc[i]),
-                        },
-                    )
+            for curve_key, curve in curves.items():
+                name = curve_key.removeprefix("_curve_")
+                for i, v in enumerate(curve):
+                    writer.write_scalars(i + 1, {f"test_curve/{name}": float(v)})
             logging.info(f"Test metrics: {test_metrics}")
 
         if cfg.test_only and start_step <= 1:
@@ -712,3 +719,7 @@ if __name__ == "__main__":
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()  # important: joins any internal workers
+
+
+
+
