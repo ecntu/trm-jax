@@ -19,7 +19,7 @@ for seed in {1..3}; do
             echo "Testing with init_state=${init_state}, seed=${seed}, k=${k}"
             uv run --with jax[tpu] main.py \
                 --init_state $init_state --test_k $k --seed $seed \
-                --test_only --test_size 76800 --N_sup_test 512 \
+                --test_only --test_size 76800 --N_sup_test 768 \
                 --workdir logs/random-init/init-state${init_state}_seed${seed} \
                 --logdir logs/random-init/init-state${init_state}_seed${seed}/test_k${k}
         done
