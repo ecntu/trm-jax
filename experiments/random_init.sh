@@ -10,7 +10,7 @@ for seed in {1..3}; do
         echo "Running with init_state=${init_state}, seed=${seed}"
         uv run --with jax[tpu] main.py \
             --init_state $init_state --test_k 3 \
-            --seed $seed --skip_test \
+            --seed $seed --skip_test --steps 10_000 \
             --max_checkpoints 1 --workdir logs/random-init/init-state${init_state}_seed${seed}
 
         ks=(1)
