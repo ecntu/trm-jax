@@ -613,6 +613,22 @@ if __name__ == "__main__":
         )
 
         def _run_test():
+            if (
+                checkpoint_manager is not None
+                and checkpoint_manager.best_step() is not None
+            ):
+                best_step = checkpoint_manager.best_step()
+                restored = checkpoint_manager.restore(
+                    best_step,
+                    args=ocp.args.Composite(
+                        ema_model=ocp.args.StandardRestore(nnx.state(ema_model))
+                    ),
+                )
+                nnx.update(ema_model, restored["ema_model"])
+                logging.info(
+                    f"Restored best checkpoint at step {best_step} for testing."
+                )
+
             logging.info("Testing ...")
             test_metrics = evaluate_epoch(
                 ema_model, test_loader, cfg, rngs, mesh, log_curves=True
