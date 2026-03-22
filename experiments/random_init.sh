@@ -4,7 +4,7 @@
 # And, for random inits,
 # Note: hardcoded test_k=3 (for val curves) during training
 
-for seed in {1..3}; do
+for seed in {1..5}; do
     for init_state in random static; do
 
         echo "Running with init_state=${init_state}, seed=${seed}"
