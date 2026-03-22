@@ -11,7 +11,7 @@ for seed in {1..5}; do
         echo "Running with on_policy=${on_policy}, seed=${seed}"
         uv run --with jax[tpu] main.py \
             $on_policy_flag --seed $seed \
-            --test_size 10_000 --N_sup_test 768 \
+            --steps 10_000 --test_size 10_000 --N_sup_test 768 \
             --workdir logs/on-policy/onpolicy${on_policy}_seed${seed}
     done
 done

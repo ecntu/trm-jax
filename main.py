@@ -618,7 +618,11 @@ if __name__ == "__main__":
                 ema_model, test_loader, cfg, rngs, mesh, log_curves=True
             )
 
-            curves = {k: test_metrics.pop(k) for k in list(test_metrics) if k.startswith("_curve_")}
+            curves = {
+                k: test_metrics.pop(k)
+                for k in list(test_metrics)
+                if k.startswith("_curve_")
+            }
 
             test_metrics = {
                 k.replace("eval/", "test/"): v for k, v in test_metrics.items()
@@ -719,7 +723,3 @@ if __name__ == "__main__":
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()  # important: joins any internal workers
-
-
-
-
