@@ -96,6 +96,28 @@ class TRM(nnx.Module):
         )
         return y_hats, q_hats, (ys, zs)
 
+    def predict_conf_online(self, x_input, N_sup=16, n=6, T=3, k=4, rngs=None):
+        """At each step, branch into k noisy candidates and keep the most confident."""
+        x = self.input_embedding(x_input)
+        batch_size, seq_len, _ = x.shape
+        y = self.init_y(batch_size, seq_len, rngs)
+        z = self.init_z(batch_size, seq_len, rngs)
+        noise_scale = self.init_y.scale  # matches initialization scale
+
+        def step(carry, rng):
+            y, z = carry
+            ys = y + jax.random.normal(rng, (k, *y.shape)) * noise_scale
+            zs = z + jax.random.normal(jax.random.fold_in(rng, 1), (k, *z.shape)) * noise_scale
+            (ys, zs), y_hats, q_hats = jax.vmap(
+                lambda y_k, z_k: self(x=x, y=y_k, z=z_k, n=n, T=T)
+            )(ys, zs)
+            best = q_hats.mean(axis=(1, 2)).argmax()  # global: most confident across batch
+            return (ys[best], zs[best]), (y_hats[best], q_hats[best])
+
+        keys = jax.random.split(rngs(), N_sup)
+        (y, z), (y_hats, q_hats) = lax.scan(step, (y, z), keys)
+        return y_hats, q_hats, (y, z)
+
 
 def _find_multiple(a, b):
     return (-(a // -b)) * b
@@ -372,6 +394,18 @@ def eval_step(model, batch, cfg, rngs):
             "solved_acc_per_step_mode": mode_solved_acc,
         }
 
+    if cfg.conf_online_k > 0:
+        online_rngs = nnx.Rngs(rngs())
+        online_y_hats, _, _ = model.predict_conf_online(
+            x_input, N_sup=cfg.N_sup_test, n=cfg.n, T=cfg.T,
+            k=cfg.conf_online_k, rngs=online_rngs,
+        )
+        online_metrics = pred_metrics(
+            online_y_hats.argmax(axis=-1), y_true,
+            prefix="eval_conf_online", train_N=train_N,
+        )
+        metrics = {**metrics, **online_metrics}
+
     return {
         **metrics,
         "cell_acc_per_step": cell_acc,
@@ -512,6 +546,7 @@ class cfg:
     test_size: int | None = None
     N_sup_test: int = 16 * 4
     test_k: int = 1
+    conf_online_k: int = 0  # >0: online greedy search; pick most confident of k noisy candidates each step
 
     seed: int = None
     data_seed: int = 42
