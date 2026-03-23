@@ -18,11 +18,12 @@ else
 fi
 
 for seed in {1..5}; do
-    for variant in baseline rand_T halt_exploration_prob; do
+    for variant in baseline rand_T halt_exploration_prob rand_N_sup; do
 
         VARIANT_ARGS=""
         [[ "$variant" == "rand_T" ]] && VARIANT_ARGS="--rand_T"
         [[ "$variant" == "halt_exploration_prob" ]] && VARIANT_ARGS="--halt_exploration_prob 0.5"
+        [[ "$variant" == "rand_N_sup" ]] && VARIANT_ARGS="--rand_N_sup"
 
         echo "Running with variant=${variant}, seed=${seed}, size=${SIZE}"
         uv run --with jax[tpu] main.py \
