@@ -251,7 +251,9 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         T = cfg.T
 
     if cfg.rand_N_sup:
-        rand_n_sup = jax.random.randint(rngs(), shape=(), minval=1, maxval=cfg.N_sup + 1)
+        rand_n_sup = jax.random.randint(
+            rngs(), shape=(), minval=1, maxval=cfg.N_sup + 1
+        )
     else:
         rand_n_sup = cfg.N_sup
 
@@ -263,8 +265,9 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         step, model, opt, y_in, z_in, alive, rngs = carry
 
         # update step
+        step_T = jnp.where(cfg.warmup_T & (step == 1), 1, T)
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y_in, z_in, y_true, alive, cfg, T
+            model, x, y_in, z_in, y_true, alive, cfg, step_T
         )
         scaled_grads = jax.tree.map(lambda g: g * (step <= rand_n_sup), grads)
         opt.update(model, scaled_grads)
@@ -497,6 +500,7 @@ class cfg:
     rand_n: bool = False  # TODO
     rand_T: bool = False
     rand_N_sup: bool = False
+    warmup_T: bool = False  # use T=1 for the first supervision step
 
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
