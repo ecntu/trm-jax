@@ -381,10 +381,14 @@ def eval_step(model, batch, cfg, rngs):
             "solved_acc_per_step_mode": mode_solved_acc,
         }
 
+    aa = asymptotic_alignment_score(model, batch, cfg, rngs)
+
     return {
         **metrics,
+        **{k: v for k, v in aa.items() if "_per_step" not in k},
         "cell_acc_per_step": cell_acc,
         "solved_acc_per_step": solved_acc,
+        "aa_pred_match_per_step": aa["aa_pred_match_per_step"],
         "batch_size": x_input.shape[0],
     }
 
@@ -422,6 +426,21 @@ def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
 @nnx.jit(static_argnames=("cfg",))
 def asymptotic_alignment_score(model, batch, cfg, rngs):
     """arxiv:2211.09961"""
+    y_hats1, _, (y1, z1) = model.predict(
+        batch["inputs"], N_sup=cfg.N_sup_test, n=cfg.n, T=cfg.T, rngs=rngs
+    )
+
+    y1_s, z1_s = jnp.roll(y1, shift=1, axis=0), jnp.roll(z1, shift=1, axis=0)
+
+    y_hats2, _, (y2, z2) = model.predict(
+        batch["inputs"],
+        y=y1_s,
+        z=z1_s,
+        N_sup=cfg.N_sup_test,
+        n=cfg.n,
+        T=cfg.T,
+        rngs=rngs,
+    )
 
     def cos_sim(a, b):
         a, b = rearrange(a, "b ... -> b (...)"), rearrange(b, "b ... -> b (...)")
@@ -429,23 +448,16 @@ def asymptotic_alignment_score(model, batch, cfg, rngs):
             jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
         ).clip(min=1e-8)
 
-    model.eval()
-    y_hats1, _, (y1, z1) = model.predict(
-        batch["inputs"], N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
+    # curve over inference depth: (N_sup_test,)
+    pred_match_curve = (y_hats1.argmax(axis=-1) == y_hats2.argmax(axis=-1)).mean(
+        axis=(-1, -2)
     )
-
-    y1_s, z1_s = jnp.roll(y1, shift=1, axis=0), jnp.roll(z1, shift=1, axis=0)
-
-    y_hats2, _, (y2, z2) = model.predict(
-        batch["inputs"], y=y1_s, z=z1_s, N_sup=cfg.N_sup, n=cfg.n, T=cfg.T, rngs=rngs
-    )
-
-    pred_match = (y_hats1[-1].argmax(axis=-1) == y_hats2[-1].argmax(axis=-1)).mean()
 
     return {
-        "asymp_align/pred_match": pred_match,
+        "asymp_align/pred_match": pred_match_curve[-1],
         "asymp_align/y_cos_sim": cos_sim(y1, y2).mean(),
         "asymp_align/z_cos_sim": cos_sim(z1, z2).mean(),
+        "aa_pred_match_per_step": pred_match_curve,
     }
 
 
@@ -701,19 +713,6 @@ if __name__ == "__main__":
                 every_steps=cfg.val_every,
                 on_steps=[cfg.steps],
                 callback_fn=_run_val,
-            ),
-            periodic_actions.PeriodicCallback(
-                every_steps=cfg.val_every,
-                callback_fn=lambda step, t: writer.write_scalars(
-                    step,
-                    calc_metric_over_batches(
-                        lambda batch: asymptotic_alignment_score(
-                            ema_model, batch, cfg, rngs
-                        ),
-                        iter(val_loader),
-                        mesh,
-                    ),
-                ),
             ),
         ]
         if checkpoint_manager is not None:
