@@ -132,18 +132,27 @@ def save_checkpoint(
     )
 
 
-def calc_metric_over_batches(metric_fn, data_iter, mesh=None, num_batches=100):
-    """Generic function to calculate metrics over multiple batches and average."""
-    totals = defaultdict(float)
+def calc_metric_over_batches(metric_fn, data_iter, mesh=None):
+    """Accumulate metrics over all batches, weighted by batch size.
 
-    for i, batch in enumerate(data_iter):
-        if i >= num_batches:
-            break
+    metric_fn must return {"scalars": {...}, "curves": {...}}.
+    Returns (scalars, curves), each a weighted average over the dataset.
+    """
+    scalar_sums = defaultdict(float)
+    curve_sums = defaultdict(float)
+    total_weight = 0.0
+
+    for batch in data_iter:
         if mesh is not None:
             batch = shard_batch(batch)
+        result = metric_fn(batch)
+        bs = float(batch["inputs"].shape[0])
+        for k, v in result["scalars"].items():
+            scalar_sums[k] += v * bs
+        for k, v in result["curves"].items():
+            curve_sums[k] += v * bs
+        total_weight += bs
 
-        metrics = metric_fn(batch)
-        for k, v in metrics.items():
-            totals[k] += v
-
-    return {k: v / num_batches for k, v in totals.items()}
+    scalars = {k: v / total_weight for k, v in scalar_sums.items()}
+    curves = {k: v / total_weight for k, v in curve_sums.items()}
+    return scalars, curves

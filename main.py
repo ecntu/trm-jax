@@ -15,7 +15,6 @@ import random
 import contextlib
 from dataclasses import dataclass
 from functools import partial
-from collections import defaultdict
 from absl import logging
 from clu import metric_writers, periodic_actions
 import simple_parsing
@@ -353,9 +352,10 @@ def eval_step(model, batch, cfg, rngs):
     k_preds, q_hats = jax.vmap(one_pred)(keys)
 
     preds = k_preds[0]
-    metrics, cell_acc, solved_acc = pred_metrics(
+    scalars, cell_acc, solved_acc = pred_metrics(
         preds, y_true, prefix="eval", train_N=train_N, return_curves=True
     )
+    curves = {"cell_acc": cell_acc, "solved_acc": solved_acc}
 
     if cfg.test_k > 1:
         conf_preds = rearrange(
@@ -365,62 +365,35 @@ def eval_step(model, batch, cfg, rngs):
         mode_preds = jnp.argmax(
             jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1
         )
-        conf_metrics, conf_cell_acc, conf_solved_acc = pred_metrics(
+        conf_scalars, conf_cell_acc, conf_solved_acc = pred_metrics(
             conf_preds, y_true, prefix="eval_conf", train_N=train_N, return_curves=True
         )
-        mode_metrics, mode_cell_acc, mode_solved_acc = pred_metrics(
+        mode_scalars, mode_cell_acc, mode_solved_acc = pred_metrics(
             mode_preds, y_true, prefix="eval_mode", train_N=train_N, return_curves=True
         )
-        metrics = {
-            **metrics,
-            **conf_metrics,
-            **mode_metrics,
-            "cell_acc_per_step_conf": conf_cell_acc,
-            "solved_acc_per_step_conf": conf_solved_acc,
-            "cell_acc_per_step_mode": mode_cell_acc,
-            "solved_acc_per_step_mode": mode_solved_acc,
+        scalars = {**scalars, **conf_scalars, **mode_scalars}
+        curves = {
+            **curves,
+            "cell_acc_conf": conf_cell_acc,
+            "solved_acc_conf": conf_solved_acc,
+            "cell_acc_mode": mode_cell_acc,
+            "solved_acc_mode": mode_solved_acc,
         }
 
-    aa = asymptotic_alignment_score(model, batch, cfg, rngs)
-
-    return {
-        **metrics,
-        **{k: v for k, v in aa.items() if "_per_step" not in k},
-        "cell_acc_per_step": cell_acc,
-        "solved_acc_per_step": solved_acc,
-        "aa_pred_match_per_step": aa["aa_pred_match_per_step"],
-        "batch_size": x_input.shape[0],
-    }
+    return {"scalars": scalars, "curves": curves}
 
 
-def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, log_curves=False):
-    totals = defaultdict(float)
-    all_curve_steps = defaultdict(list)
-    total_weight = 0.0
-
-    for batch in data_iter:
-        if mesh is not None:
-            batch = shard_batch(batch)
-        metrics = eval_step(model, batch, cfg, rngs)
-        bs = float(metrics.pop("batch_size"))
-
-        for k in [k for k in metrics if "_per_step" in k]:
-            if log_curves:
-                all_curve_steps[k].append(metrics.pop(k) * bs)
-            else:
-                metrics.pop(k)
-
-        for k, v in metrics.items():
-            totals[k] += v * bs
-        total_weight += bs
-
-    results = {k: v / total_weight for k, v in totals.items()}
-
-    if log_curves:
-        for k, arrays in all_curve_steps.items():
-            results[f"_curve_{k.replace('_per_step', '')}"] = sum(arrays) / total_weight
-
-    return results
+def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, prefix="val"):
+    scalars, curves = calc_metric_over_batches(
+        lambda batch: eval_step(model, batch, cfg, rngs), data_iter, mesh
+    )
+    renamed = {}
+    for k, v in scalars.items():
+        k = k.replace("eval_conf/", f"{prefix}_conf/")
+        k = k.replace("eval_mode/", f"{prefix}_mode/")
+        k = k.replace("eval/", f"{prefix}/")
+        renamed[k] = v
+    return renamed, curves
 
 
 @nnx.jit(static_argnames=("cfg",))
@@ -454,11 +427,21 @@ def asymptotic_alignment_score(model, batch, cfg, rngs):
     )
 
     return {
-        "asymp_align/pred_match": pred_match_curve[-1],
-        "asymp_align/y_cos_sim": cos_sim(y1, y2).mean(),
-        "asymp_align/z_cos_sim": cos_sim(z1, z2).mean(),
-        "aa_pred_match_per_step": pred_match_curve,
+        "scalars": {
+            "asymp_align/pred_match": pred_match_curve[-1],
+            "asymp_align/y_cos_sim": cos_sim(y1, y2).mean(),
+            "asymp_align/z_cos_sim": cos_sim(z1, z2).mean(),
+        },
+        "curves": {"aa_pred_match": pred_match_curve},
     }
+
+
+def run_aa_epoch(model, data_iter, cfg, rngs, mesh=None):
+    return calc_metric_over_batches(
+        lambda batch: asymptotic_alignment_score(model, batch, cfg, rngs),
+        data_iter,
+        mesh,
+    )
 
 
 def model_factory(cfg, param_dtype, compute_dtype, rngs):
@@ -617,7 +600,7 @@ if __name__ == "__main__":
                 else os.path.abspath(cfg.workdir),
                 options=ocp.CheckpointManagerOptions(
                     best_mode="max",
-                    best_fn=lambda m: m["eval/solved_acc"],
+                    best_fn=lambda m: m["val/solved_acc"],
                     max_to_keep=cfg.max_checkpoints,
                 ),
             )
@@ -653,26 +636,21 @@ if __name__ == "__main__":
                 )
 
             logging.info("Testing ...")
-            test_metrics = evaluate_epoch(
-                ema_model, test_loader, cfg, rngs, mesh, log_curves=True
+            scalars, curves = evaluate_epoch(
+                ema_model, test_loader, cfg, rngs, mesh, prefix="test"
+            )
+            aa_scalars, aa_curves = run_aa_epoch(
+                ema_model, test_loader, cfg, rngs, mesh
             )
 
-            curves = {
-                k: test_metrics.pop(k)
-                for k in list(test_metrics)
-                if k.startswith("_curve_")
-            }
+            writer.write_scalars(0, {**scalars, **aa_scalars})
 
-            test_metrics = {
-                k.replace("eval/", "test/"): v for k, v in test_metrics.items()
-            }
-            writer.write_scalars(0, test_metrics)
-
-            for curve_key, curve in curves.items():
-                name = curve_key.removeprefix("_curve_")
+            all_curves = {**curves, **aa_curves}
+            for name, curve in all_curves.items():
                 for i, v in enumerate(curve):
                     writer.write_scalars(i + 1, {f"test_curve/{name}": float(v)})
-            logging.info(f"Test metrics: {test_metrics}")
+
+            logging.info(f"Test metrics: {scalars}")
 
         if cfg.test_only and start_step <= 1:
             logging.error("No checkpoint found for test_only run.")
@@ -691,9 +669,9 @@ if __name__ == "__main__":
         last_eval_metrics = {"metrics": None}
 
         def _run_val(step, t):
-            m = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh)
-            last_eval_metrics["metrics"] = m
-            writer.write_scalars(step, m)
+            scalars, _ = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh, prefix="val")
+            last_eval_metrics["metrics"] = scalars
+            writer.write_scalars(step, scalars)
 
         def _save_checkpoint(step, t):
             if last_eval_metrics["metrics"] is None:
