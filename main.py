@@ -662,6 +662,9 @@ if __name__ == "__main__":
 
             logging.info(f"Test metrics: {scalars}")
 
+            if (cfg.logdir or cfg.workdir) is not None and jax.process_index() == 0:
+                open(os.path.join(cfg.logdir or cfg.workdir, "TESTED"), "w").close()
+
         if cfg.test_only and start_step <= 1:
             logging.error("No checkpoint found for test_only run.")
             exit(1)
@@ -679,7 +682,9 @@ if __name__ == "__main__":
         last_eval_metrics = {"metrics": None}
 
         def _run_val(step, t):
-            scalars, _ = evaluate_epoch(ema_model, val_loader, cfg, rngs, mesh, prefix="val")
+            scalars, _ = evaluate_epoch(
+                ema_model, val_loader, cfg, rngs, mesh, prefix="val"
+            )
             last_eval_metrics["metrics"] = scalars
             writer.write_scalars(step, scalars)
 
@@ -732,8 +737,12 @@ if __name__ == "__main__":
                 if step >= cfg.steps:
                     break
 
+            if (cfg.logdir or cfg.workdir) is not None and jax.process_index() == 0:
+                open(os.path.join(cfg.logdir or cfg.workdir, "TRAINED"), "w").close()
+
             if not cfg.skip_test:
                 _run_test()
+
             if checkpoint_manager is not None:
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()  # important: joins any internal workers
