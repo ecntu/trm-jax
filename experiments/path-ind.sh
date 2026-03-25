@@ -18,22 +18,53 @@ else
 fi
 
 for seed in {1..5}; do
-    for variant in baseline random_init rand_T halt_exploration_prob rand_N_sup warmup_T; do
-
-        VARIANT_ARGS=""
-        [[ "$variant" == "rand_T" ]] && VARIANT_ARGS="--rand_T"
-        [[ "$variant" == "halt_exploration_prob" ]] && VARIANT_ARGS="--halt_exploration_prob 0.5"
-        [[ "$variant" == "rand_N_sup" ]] && VARIANT_ARGS="--rand_N_sup"
-        [[ "$variant" == "warmup_T" ]] && VARIANT_ARGS="--warmup_T"
+    for variant in baseline random_init rand_T rand_N_sup rand_T_and_N_sup; do
 
         INIT_ARGS=""
         [[ "$variant" != "baseline" ]] && INIT_ARGS="--init_state random"
 
-        echo "Running with variant=${variant}, seed=${seed}, size=${SIZE}"
-        uv run --with jax[tpu] main.py \
-            $VARIANT_ARGS $INIT_ARGS --seed $seed \
-            --steps $STEPS --test_size 10_000 --N_sup_test $N_SUP_TEST \
-            --max_checkpoints 0 --workdir ${LOG_PREFIX}/${variant}/seed${seed} $EXTRA_ARGS
+        # Determine width sweeps per variant (T widths limited to 1,2 since T=3)
+        if [[ "$variant" == "rand_T" ]]; then
+            T_WIDTHS=(1 2)
+            N_WIDTHS=(0)
+        elif [[ "$variant" == "rand_N_sup" ]]; then
+            T_WIDTHS=(0)
+            N_WIDTHS=(1 2 4 8)
+        elif [[ "$variant" == "rand_T_and_N_sup" ]]; then
+            T_WIDTHS=(1 2)
+            N_WIDTHS=(1 2 4 8)
+        else
+            T_WIDTHS=(0)
+            N_WIDTHS=(0)
+        fi
 
+        for t_width in "${T_WIDTHS[@]}"; do
+        for n_width in "${N_WIDTHS[@]}"; do
+
+            VARIANT_ARGS=""
+            WIDTH_ARGS=""
+            WORKDIR_SUFFIX=""
+            if [[ "$variant" == "rand_T" ]]; then
+                VARIANT_ARGS="--rand_T"
+                WIDTH_ARGS="--rand_T_width $t_width"
+                WORKDIR_SUFFIX="/wT${t_width}"
+            elif [[ "$variant" == "rand_N_sup" ]]; then
+                VARIANT_ARGS="--rand_N_sup"
+                WIDTH_ARGS="--rand_N_sup_width $n_width"
+                WORKDIR_SUFFIX="/wN${n_width}"
+            elif [[ "$variant" == "rand_T_and_N_sup" ]]; then
+                VARIANT_ARGS="--rand_T --rand_N_sup"
+                WIDTH_ARGS="--rand_T_width $t_width --rand_N_sup_width $n_width"
+                WORKDIR_SUFFIX="/wT${t_width}_wN${n_width}"
+            fi
+
+            echo "Running with variant=${variant}, t_width=${t_width}, n_width=${n_width}, seed=${seed}, size=${SIZE}"
+            uv run --with jax[tpu] main.py \
+                $VARIANT_ARGS $WIDTH_ARGS $INIT_ARGS --seed $seed \
+                --steps $STEPS --test_size 10_000 --N_sup_test $N_SUP_TEST \
+                --max_checkpoints 0 --workdir ${LOG_PREFIX}/${variant}${WORKDIR_SUFFIX}/seed${seed} $EXTRA_ARGS
+
+        done
+        done
     done
 done

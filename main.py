@@ -245,13 +245,21 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
     )
 
     if cfg.rand_T:
-        T = jax.random.randint(rngs(), shape=(), minval=1, maxval=cfg.T + 1)
+        T = jax.random.randint(
+            rngs(),
+            shape=(),
+            minval=max(1, cfg.T - cfg.rand_T_width),
+            maxval=cfg.T + cfg.rand_T_width + 1,
+        )
     else:
         T = cfg.T
 
     if cfg.rand_N_sup:
         rand_n_sup = jax.random.randint(
-            rngs(), shape=(), minval=1, maxval=cfg.N_sup + 1
+            rngs(),
+            shape=(),
+            minval=max(1, cfg.N_sup - cfg.rand_N_sup_width),
+            maxval=cfg.N_sup + cfg.rand_N_sup_width + 1,
         )
     else:
         rand_n_sup = cfg.N_sup
@@ -495,6 +503,8 @@ class cfg:
     rand_n: bool = False  # TODO
     rand_T: bool = False
     rand_N_sup: bool = False
+    rand_T_width: int = 1  # half-width of support for rand_T
+    rand_N_sup_width: int = 1  # half-width of support for rand_N_sup
     warmup_T: bool = False  # use T=1 for the first supervision step
 
     halt_loss_weight: float = 0.5
