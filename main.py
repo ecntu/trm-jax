@@ -174,8 +174,8 @@ class InitState(nnx.Module):
         return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
 
 
-def loss_fn(model, x, y, z, y_true, alive, cfg, T):
-    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=cfg.n, T=T)
+def loss_fn(model, x, y, z, y_true, alive, cfg, T, n):
+    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T)
 
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
     alive = alive.astype(jnp.float32)
@@ -244,6 +244,16 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         model.init_z(bs, seq_len, rngs),
     )
 
+    if cfg.rand_n:
+        n = jax.random.randint(
+            rngs(),
+            shape=(),
+            minval=max(1, cfg.n - cfg.rand_n_width),
+            maxval=cfg.n + cfg.rand_n_width + 1,
+        )
+    else:
+        n = cfg.n
+
     if cfg.rand_T:
         T = jax.random.randint(
             rngs(),
@@ -274,13 +284,13 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         # update step
         step_T = jnp.where(cfg.warmup_T & (step == 1), 1, T)
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y_in, z_in, y_true, alive, cfg, step_T
+            model, x, y_in, z_in, y_true, alive, cfg, step_T, n
         )
         scaled_grads = jax.tree.map(lambda g: g * (step <= rand_n_sup), grads)
         opt.update(model, scaled_grads)
 
         if cfg.stay_on_policy:
-            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=cfg.n, T=T)
+            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=n, T=T)
 
         # add noise to latents (new) TODO mess with std shape
         corr_std = (
@@ -500,10 +510,11 @@ class cfg:
     N_sup: int = 16
     n: int = 6
     T: int = 3
-    rand_n: bool = False  # TODO
+    rand_n: bool = False
+    rand_n_width: int = 2  # half-width of support for rand_n
     rand_T: bool = False
-    rand_N_sup: bool = False
     rand_T_width: int = 1  # half-width of support for rand_T
+    rand_N_sup: bool = False
     rand_N_sup_width: int = 1  # half-width of support for rand_N_sup
     warmup_T: bool = False  # use T=1 for the first supervision step
 

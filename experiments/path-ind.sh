@@ -18,7 +18,7 @@ else
 fi
 
 for seed in {1..5}; do
-    for variant in baseline random_init rand_T rand_N_sup rand_T_and_N_sup; do
+    for variant in baseline random_init rand_T rand_N_sup rand_n; do
 
         INIT_ARGS=""
         [[ "$variant" != "baseline" ]] && INIT_ARGS="--init_state random"
@@ -26,19 +26,24 @@ for seed in {1..5}; do
         # Determine width sweeps per variant (T widths limited to 1,2 since T=3)
         if [[ "$variant" == "rand_T" ]]; then
             T_WIDTHS=(1 2)
+            N_SUP_WIDTHS=(0)
             N_WIDTHS=(0)
         elif [[ "$variant" == "rand_N_sup" ]]; then
             T_WIDTHS=(0)
-            N_WIDTHS=(2 4 8)
-        elif [[ "$variant" == "rand_T_and_N_sup" ]]; then
-            T_WIDTHS=(1 2)
-            N_WIDTHS=(2 4 8)
+            N_SUP_WIDTHS=(2 4 8)
+            N_WIDTHS=(0)
+        elif [[ "$variant" == "rand_n" ]]; then
+            T_WIDTHS=(0)
+            N_SUP_WIDTHS=(0)
+            N_WIDTHS=(1 2 4)
         else
             T_WIDTHS=(0)
+            N_SUP_WIDTHS=(0)
             N_WIDTHS=(0)
         fi
 
         for t_width in "${T_WIDTHS[@]}"; do
+        for n_sup_width in "${N_SUP_WIDTHS[@]}"; do
         for n_width in "${N_WIDTHS[@]}"; do
 
             VARIANT_ARGS=""
@@ -50,23 +55,24 @@ for seed in {1..5}; do
                 WORKDIR_SUFFIX="/wT${t_width}"
             elif [[ "$variant" == "rand_N_sup" ]]; then
                 VARIANT_ARGS="--rand_N_sup"
-                WIDTH_ARGS="--rand_N_sup_width $n_width"
-                WORKDIR_SUFFIX="/wN${n_width}"
-            elif [[ "$variant" == "rand_T_and_N_sup" ]]; then
-                VARIANT_ARGS="--rand_T --rand_N_sup"
-                WIDTH_ARGS="--rand_T_width $t_width --rand_N_sup_width $n_width"
-                WORKDIR_SUFFIX="/wT${t_width}_wN${n_width}"
+                WIDTH_ARGS="--rand_N_sup_width $n_sup_width"
+                WORKDIR_SUFFIX="/wN${n_sup_width}"
+            elif [[ "$variant" == "rand_n" ]]; then
+                VARIANT_ARGS="--rand_n"
+                WIDTH_ARGS="--rand_n_width $n_width"
+                WORKDIR_SUFFIX="/wn${n_width}"
             fi
 
             WORKDIR="${LOG_PREFIX}/${variant}${WORKDIR_SUFFIX}/seed${seed}"
             [[ -f "${WORKDIR}/TESTED" ]] && { echo "Skipping (already tested): ${WORKDIR}"; continue; }
 
-            echo "Running with variant=${variant}, t_width=${t_width}, n_width=${n_width}, seed=${seed}, size=${SIZE}"
+            echo "Running with variant=${variant}, t_width=${t_width}, n_sup_width=${n_sup_width}, n_width=${n_width}, seed=${seed}, size=${SIZE}"
             uv run --with jax[tpu] main.py \
                 $VARIANT_ARGS $WIDTH_ARGS $INIT_ARGS --seed $seed \
                 --steps $STEPS --test_size 10_000 --N_sup_test $N_SUP_TEST \
                 --max_checkpoints 0 --workdir "${WORKDIR}" $EXTRA_ARGS
 
+        done
         done
         done
     done
