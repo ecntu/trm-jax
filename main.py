@@ -48,31 +48,43 @@ class TRM(nnx.Module):
         self.init_y = init_y
         self.init_z = init_z
 
-    def latent_recursion(self, *, x, y, z, n=6):
+    def latent_recursion(self, *, x, y, z, n, n_max=None):
         # refine the latent (z) n times
-        def refine_latent(_, carry):
-            y, z = carry
-            z = self.net(x=x, y=y, z=z)
-            return y, z
+        if n_max is None:
+            # static n
+            def refine_latent(_, carry):
+                y, z = carry
+                z = self.net(x=x, y=y, z=z)
+                return y, z
 
-        y, z = lax.fori_loop(0, n, refine_latent, (y, z))
+            y, z = lax.fori_loop(0, n, refine_latent, (y, z))
+        else:
+            # (for rand_n): scan over n_max steps, masking updates beyond n
+            def refine_masked(carry, step):
+                y, z = carry
+                z_new = self.net(x=x, y=y, z=z)
+                z = jnp.where(step < n, z_new, z)
+                return (y, z), None
+
+            (y, z), _ = lax.scan(refine_masked, (y, z), jnp.arange(n_max))
+
         y = self.net(x=jnp.zeros_like(x), y=y, z=z)  # refine output (y) once
         return y, z
 
-    def __call__(self, *, x, y, z, n=6, T=3):  # deep recursion
+    def __call__(self, *, x, y, z, n=6, T=3, n_max=None):  # deep recursion
         # run T steps; stop grads for steps < T-1
 
         # stop gradients for T-1 steps
         def body(_, carry):
             y, z = carry
-            y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
+            y, z = self.latent_recursion(x=x, y=y, z=z, n=n, n_max=n_max)
             return y, z
 
         y, z = lax.fori_loop(0, T - 1, body, (y, z))
         y, z = sg(y), sg(z)
 
         # final step with gradients
-        y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
+        y, z = self.latent_recursion(x=x, y=y, z=z, n=n, n_max=n_max)
         return (y, z), self.output_head(y), self.Q_head(y)
 
     def predict(self, x_input, y=None, z=None, N_sup=16, n=6, T=3, rngs=None):
@@ -175,7 +187,8 @@ class InitState(nnx.Module):
 
 
 def loss_fn(model, x, y, z, y_true, alive, cfg, T, n):
-    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T)
+    n_max = cfg.n + cfg.rand_n_width if cfg.rand_n else None
+    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T, n_max=n_max)
 
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
     alive = alive.astype(jnp.float32)
@@ -290,7 +303,8 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         opt.update(model, scaled_grads)
 
         if cfg.stay_on_policy:
-            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=n, T=T)
+            n_max = cfg.n + cfg.rand_n_width if cfg.rand_n else None
+            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=n, T=T, n_max=n_max)
 
         # add noise to latents (new) TODO mess with std shape
         corr_std = (
