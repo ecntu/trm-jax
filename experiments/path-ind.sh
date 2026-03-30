@@ -69,7 +69,7 @@ for seed in {1..5}; do
             echo "Running with variant=${variant}, t_width=${t_width}, n_sup_width=${n_sup_width}, n_width=${n_width}, seed=${seed}, size=${SIZE}"
             uv run --with jax[tpu] main.py \
                 $VARIANT_ARGS $WIDTH_ARGS $INIT_ARGS --seed $seed \
-                --steps $STEPS --test_size 10_000 --N_sup_test $N_SUP_TEST \
+                --steps $STEPS --test_size 100_000 --N_sup_test $N_SUP_TEST \
                 --max_checkpoints 0 --workdir "${WORKDIR}" $EXTRA_ARGS
 
         done
