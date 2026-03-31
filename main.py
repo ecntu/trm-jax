@@ -171,19 +171,20 @@ class Net(nnx.Module):
 
 class InitState(nnx.Module):
     def __init__(self, mode, h_dim, rngs):
+        self.h_dim = h_dim
         self.scale = jnp.sqrt(1 / h_dim)  # match input emb scale
-        self.gen_state = partial(jax.random.normal, shape=(1, 1, h_dim))
-        if mode == "static":
-            self.state = self.gen_state(rngs.next()) * self.scale
-        else:
-            self.state = None
+        self.state = (
+            jax.random.normal(rngs.next(), (1, 1, h_dim)) * self.scale
+            if mode == "static"
+            else None
+        )
 
     def __call__(self, batch_size, seq_len, rngs=None):
         if self.state is None:
-            base = self.gen_state(rngs.next()) * self.scale
+            base = jax.random.normal(rngs.next(), (batch_size, 1, self.h_dim)) * self.scale
         else:
             base = self.state
-        return jnp.broadcast_to(base, (batch_size, seq_len, base.shape[-1]))
+        return jnp.broadcast_to(base, (batch_size, seq_len, self.h_dim))
 
 
 def loss_fn(model, x, y, z, y_true, alive, cfg, T, n):
