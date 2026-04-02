@@ -23,6 +23,7 @@ for seed in {1..5}; do
     for init_state in random static; do
 
         WORKDIR="${LOG_PREFIX}/init-state${init_state}_seed${seed}"
+        [[ -f "${WORKDIR}/TESTED" ]] && { echo "Skipping (already tested): ${WORKDIR}"; continue; }
 
         echo "Running with init_state=${init_state}, seed=${seed}, size=${SIZE}"
         uv run --with jax[tpu] main.py \
