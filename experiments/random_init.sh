@@ -25,11 +25,13 @@ for seed in {1..5}; do
         WORKDIR="${LOG_PREFIX}/init-state${init_state}_seed${seed}"
         [[ -f "${WORKDIR}/TESTED" ]] && { echo "Skipping (already tested): ${WORKDIR}"; continue; }
 
-        echo "Running with init_state=${init_state}, seed=${seed}, size=${SIZE}"
-        uv run --with jax[tpu] main.py \
-            --init_state $init_state --test_k 3 \
-            --seed $seed --skip_test --steps $STEPS \
-            --max_checkpoints 1 --workdir $WORKDIR $EXTRA_ARGS
+        if [[ ! -f "${WORKDIR}/TRAINED" ]]; then
+            echo "Running with init_state=${init_state}, seed=${seed}, size=${SIZE}"
+            uv run --with jax[tpu] main.py \
+                --init_state $init_state --test_k 3 \
+                --seed $seed --skip_test --steps $STEPS \
+                --max_checkpoints 1 --workdir $WORKDIR $EXTRA_ARGS
+        fi
 
         ks=(1)
         [[ "$init_state" == "random" ]] && ks=(1 3 5 7)
@@ -41,6 +43,7 @@ for seed in {1..5}; do
                 --workdir $WORKDIR \
                 --logdir ${WORKDIR}/test_k${k} $EXTRA_ARGS
         done
+        touch "${WORKDIR}/TESTED"
 
     done
 done
