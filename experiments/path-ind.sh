@@ -20,9 +20,6 @@ fi
 for seed in {1..5}; do
     for variant in baseline random_init rand_T rand_N_sup rand_n; do
 
-        INIT_ARGS=""
-        [[ "$variant" != "baseline" ]] && INIT_ARGS="--init_state random"
-
         # Determine width sweeps per variant (T widths limited to 1,2 since T=3)
         if [[ "$variant" == "rand_T" ]]; then
             T_WIDTHS=(1 2)
@@ -49,7 +46,9 @@ for seed in {1..5}; do
             VARIANT_ARGS=""
             WIDTH_ARGS=""
             WORKDIR_SUFFIX=""
-            if [[ "$variant" == "rand_T" ]]; then
+            if [[ "$variant" == "random_init" ]]; then
+                VARIANT_ARGS="--init_state random"
+            elif [[ "$variant" == "rand_T" ]]; then
                 VARIANT_ARGS="--rand_T"
                 WIDTH_ARGS="--rand_T_width $t_width"
                 WORKDIR_SUFFIX="/wT${t_width}"
@@ -68,7 +67,7 @@ for seed in {1..5}; do
 
             echo "Running with variant=${variant}, t_width=${t_width}, n_sup_width=${n_sup_width}, n_width=${n_width}, seed=${seed}, size=${SIZE}"
             uv run --with jax[tpu] main.py \
-                $VARIANT_ARGS $WIDTH_ARGS $INIT_ARGS --seed $seed \
+                $VARIANT_ARGS $WIDTH_ARGS --seed $seed \
                 --steps $STEPS --test_size 100_000 --N_sup_test $N_SUP_TEST \
                 --max_checkpoints 0 --workdir "${WORKDIR}" $EXTRA_ARGS
 
