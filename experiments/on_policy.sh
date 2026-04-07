@@ -12,6 +12,7 @@ for seed in {1..5}; do
         uv run --with jax[tpu] main.py \
             $on_policy_flag --seed $seed \
             --steps 10_000 --test_size 10_000 --N_sup_test 768 \
-            --workdir logs/on-policy/onpolicy${on_policy}_seed${seed}
+            --workdir logs/on-policy/onpolicy${on_policy}_seed${seed} \
+            --max_checkpoints 0
     done
 done

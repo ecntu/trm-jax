@@ -181,7 +181,9 @@ class InitState(nnx.Module):
 
     def __call__(self, batch_size, seq_len, rngs=None):
         if self.state is None:
-            base = jax.random.normal(rngs.next(), (batch_size, 1, self.h_dim)) * self.scale
+            base = (
+                jax.random.normal(rngs.next(), (batch_size, 1, self.h_dim)) * self.scale
+            )
         else:
             base = self.state
         return jnp.broadcast_to(base, (batch_size, seq_len, self.h_dim))
