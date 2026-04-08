@@ -561,6 +561,7 @@ class cfg:
     data_seed: int = 42
     workdir: str = None
     logdir: str = None
+    profile: bool = False
     checkpoint_every: int = 500
     max_checkpoints: int = 1
     use_parallel: bool = True
@@ -744,7 +745,7 @@ if __name__ == "__main__":
                     callback_fn=_save_checkpoint,
                 )
             )
-        if cfg.workdir is not None and jax.process_index() == 0:
+        if cfg.profile and cfg.workdir is not None and jax.process_index() == 0:
             hooks.append(
                 periodic_actions.Profile(num_profile_steps=5, logdir=cfg.workdir)
             )
