@@ -770,6 +770,7 @@ if __name__ == "__main__":
                 if mesh is not None:
                     batch = shard_batch(batch)
                 model.train()
+                ema_model.train()
                 model, opt, ema_model, train_metrics = train_step(
                     model, ema_model, opt, batch, cfg, rngs
                 )
