@@ -18,36 +18,49 @@ else
 fi
 
 for seed in {1..5}; do
-    for variant in baseline random_init rand_T rand_N_sup rand_n; do
+    for variant in baseline random_init noisy_static rand_T rand_N_sup rand_n; do
 
         # Determine width sweeps per variant (T widths limited to 1,2 since T=3)
         if [[ "$variant" == "rand_T" ]]; then
             T_WIDTHS=(1 2)
             N_SUP_WIDTHS=(0)
             N_WIDTHS=(0)
+            NOISE_PROPS=(0)
         elif [[ "$variant" == "rand_N_sup" ]]; then
             T_WIDTHS=(0)
             N_SUP_WIDTHS=(2 4 8)
             N_WIDTHS=(0)
+            NOISE_PROPS=(0)
         elif [[ "$variant" == "rand_n" ]]; then
             T_WIDTHS=(0)
             N_SUP_WIDTHS=(0)
             N_WIDTHS=(1 2 4)
+            NOISE_PROPS=(0)
+        elif [[ "$variant" == "noisy_static" ]]; then
+            T_WIDTHS=(0)
+            N_SUP_WIDTHS=(0)
+            N_WIDTHS=(0)
+            NOISE_PROPS=(0.5 1.0)
         else
             T_WIDTHS=(0)
             N_SUP_WIDTHS=(0)
             N_WIDTHS=(0)
+            NOISE_PROPS=(0)
         fi
 
         for t_width in "${T_WIDTHS[@]}"; do
         for n_sup_width in "${N_SUP_WIDTHS[@]}"; do
         for n_width in "${N_WIDTHS[@]}"; do
+        for noise_prop in "${NOISE_PROPS[@]}"; do
 
             VARIANT_ARGS=""
             WIDTH_ARGS=""
             WORKDIR_SUFFIX=""
             if [[ "$variant" == "random_init" ]]; then
                 VARIANT_ARGS="--init_state random"
+            elif [[ "$variant" == "noisy_static" ]]; then
+                VARIANT_ARGS="--init_state noisy_static --init_noise_prop $noise_prop"
+                WORKDIR_SUFFIX="/p${noise_prop}"
             elif [[ "$variant" == "rand_T" ]]; then
                 VARIANT_ARGS="--rand_T"
                 WIDTH_ARGS="--rand_T_width $t_width"
@@ -65,12 +78,13 @@ for seed in {1..5}; do
             WORKDIR="${LOG_PREFIX}/${variant}${WORKDIR_SUFFIX}/seed${seed}"
             [[ -f "${WORKDIR}/TESTED" ]] && { echo "Skipping (already tested): ${WORKDIR}"; continue; }
 
-            echo "Running with variant=${variant}, t_width=${t_width}, n_sup_width=${n_sup_width}, n_width=${n_width}, seed=${seed}, size=${SIZE}"
+            echo "Running with variant=${variant}, t_width=${t_width}, n_sup_width=${n_sup_width}, n_width=${n_width}, noise_prop=${noise_prop}, seed=${seed}, size=${SIZE}"
             uv run --with jax[tpu] main.py \
                 $VARIANT_ARGS $WIDTH_ARGS --seed $seed \
                 --steps $STEPS --test_size 100_000 --N_sup_test $N_SUP_TEST \
                 --max_checkpoints 0 --workdir "${WORKDIR}" $EXTRA_ARGS
 
+        done
         done
         done
         done
