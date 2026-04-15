@@ -260,8 +260,6 @@ def pred_metrics(preds, y_true, prefix, train_N=None, return_curves=False):
 
 @nnx.jit(static_argnames=("cfg",))
 def train_step(model, ema_model, opt, batch, cfg, rngs):
-    model.train()
-
     x_input, y_true = batch["inputs"], batch["labels"]
     x = model.input_embedding(x_input)
     bs, seq_len, _ = x.shape
@@ -379,7 +377,6 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
 
 @nnx.jit(static_argnames=("cfg",))
 def eval_step(model, batch, cfg, rngs):
-    model.eval()
     x_input, y_true = batch["inputs"], batch["labels"]
     keys = jax.random.split(rngs(), cfg.test_k)
 
@@ -430,6 +427,7 @@ def eval_step(model, batch, cfg, rngs):
 
 
 def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, prefix="val"):
+    model.eval()
     scalars, curves = calc_metric_over_batches(
         lambda batch: eval_step(model, batch, cfg, rngs), data_iter, mesh
     )
@@ -483,6 +481,7 @@ def asymptotic_alignment_score(model, batch, cfg, rngs):
 
 
 def run_aa_epoch(model, data_iter, cfg, rngs, mesh=None):
+    model.eval()
     return calc_metric_over_batches(
         lambda batch: asymptotic_alignment_score(model, batch, cfg, rngs),
         data_iter,
@@ -770,6 +769,7 @@ if __name__ == "__main__":
             for step, batch in enumerate(train_loader, start=start_step):
                 if mesh is not None:
                     batch = shard_batch(batch)
+                model.train()
                 model, opt, ema_model, train_metrics = train_step(
                     model, ema_model, opt, batch, cfg, rngs
                 )
