@@ -170,10 +170,11 @@ class Net(nnx.Module):
 
 
 class InitState(nnx.Module):
-    def __init__(self, mode, h_dim, rngs, noise_prop=0.5):
+    def __init__(self, mode, h_dim, rngs, noise_prop=0.5, noise_std=1.0):
         self.mode = mode
         self.h_dim = h_dim
         self.noise_prop = noise_prop
+        self.noise_std = noise_std
         self.scale = jnp.sqrt(1 / h_dim)  # match input emb scale
         self.deterministic = False  # toggled by model.train()/model.eval()
         self.state = (
@@ -193,7 +194,7 @@ class InitState(nnx.Module):
 
         if self.mode == "noisy_static" and not self.deterministic:
             shape = (batch_size, seq_len, self.h_dim)
-            noise = jax.random.normal(rngs.next(), shape) * self.scale
+            noise = jax.random.normal(rngs.next(), shape) * (self.scale * self.noise_std)
             mask = jax.random.uniform(rngs.next(), shape) < self.noise_prop
             out = out + jnp.where(mask, noise, 0.0)
 
@@ -512,10 +513,10 @@ def model_factory(cfg, param_dtype, compute_dtype, rngs):
             cfg.vocab_size, cfg.h_dim, param_dtype=param_dtype, rngs=rngs
         ),
         init_y=InitState(
-            cfg.init_state, cfg.h_dim, rngs=rngs, noise_prop=cfg.init_noise_prop
+            cfg.init_state, cfg.h_dim, rngs=rngs, noise_prop=cfg.init_noise_prop, noise_std=cfg.init_noise_std
         ),
         init_z=InitState(
-            cfg.init_state, cfg.h_dim, rngs=rngs, noise_prop=cfg.init_noise_prop
+            cfg.init_state, cfg.h_dim, rngs=rngs, noise_prop=cfg.init_noise_prop, noise_std=cfg.init_noise_std
         ),
     )
 
@@ -538,6 +539,7 @@ class cfg:
     mlp_factor: int = 4
     init_state: str = "static"
     init_noise_prop: float = 0.5  # prop of entries noised in "noisy_static" mode
+    init_noise_std: float = 0.1  # noise std as multiple of init scale (sqrt(1/h_dim))
 
     N_sup: int = 16
     n: int = 6
