@@ -82,7 +82,7 @@ for seed in {1..5}; do
             uv run --with jax[tpu] main.py \
                 $VARIANT_ARGS $WIDTH_ARGS --seed $seed \
                 --steps $STEPS --test_size 100_000 --N_sup_test $N_SUP_TEST \
-                --max_checkpoints 0 --workdir "${WORKDIR}" $EXTRA_ARGS
+                --max_checkpoints 1 --workdir "${WORKDIR}" $EXTRA_ARGS
 
         done
         done
