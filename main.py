@@ -48,43 +48,32 @@ class TRM(nnx.Module):
         self.init_y = init_y
         self.init_z = init_z
 
-    def latent_recursion(self, *, x, y, z, n, n_max=None):
+    def latent_recursion(self, *, x, y, z, n):
         # refine the latent (z) n times
-        if n_max is None:
-            # static n
-            def refine_latent(_, carry):
-                y, z = carry
-                z = self.net(x=x, y=y, z=z)
-                return y, z
+        def refine_latent(_, carry):
+            y, z = carry
+            z = self.net(x=x, y=y, z=z)
+            return y, z
 
-            y, z = lax.fori_loop(0, n, refine_latent, (y, z))
-        else:
-            # (for rand_n): scan over n_max steps, masking updates beyond n
-            def refine_masked(carry, step):
-                y, z = carry
-                z_new = self.net(x=x, y=y, z=z)
-                z = jnp.where(step < n, z_new, z)
-                return (y, z), None
-
-            (y, z), _ = lax.scan(refine_masked, (y, z), jnp.arange(n_max))
+        y, z = lax.fori_loop(0, n, refine_latent, (y, z))
 
         y = self.net(x=jnp.zeros_like(x), y=y, z=z)  # refine output (y) once
         return y, z
 
-    def __call__(self, *, x, y, z, n=6, T=3, n_max=None):  # deep recursion
+    def __call__(self, *, x, y, z, n=6, T=3):  # deep recursion
         # run T steps; stop grads for steps < T-1
 
         # stop gradients for T-1 steps
         def body(_, carry):
             y, z = carry
-            y, z = self.latent_recursion(x=x, y=y, z=z, n=n, n_max=n_max)
+            y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
             return y, z
 
         y, z = lax.fori_loop(0, T - 1, body, (y, z))
         y, z = sg(y), sg(z)
 
         # final step with gradients
-        y, z = self.latent_recursion(x=x, y=y, z=z, n=n, n_max=n_max)
+        y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
         return (y, z), self.output_head(y), self.Q_head(y)
 
     def predict(self, x_input, y=None, z=None, N_sup=16, n=6, T=3, rngs=None):
@@ -194,7 +183,9 @@ class InitState(nnx.Module):
 
         if self.mode == "noisy_static" and not self.deterministic:
             shape = (batch_size, seq_len, self.h_dim)
-            noise = jax.random.normal(rngs.next(), shape) * (self.scale * self.noise_std)
+            noise = jax.random.normal(rngs.next(), shape) * (
+                self.scale * self.noise_std
+            )
             mask = jax.random.uniform(rngs.next(), shape) < self.noise_prop
             out = out + jnp.where(mask, noise, 0.0)
 
@@ -202,8 +193,8 @@ class InitState(nnx.Module):
 
 
 def loss_fn(model, x, y, z, y_true, alive, cfg, T, n):
-    n_max = cfg.n + cfg.rand_n_width if cfg.rand_n else None
-    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T, n_max=n_max)
+
+    (y, z), y_hat, q_hat = model(x=x, y=y, z=z, n=n, T=T)
 
     y_hat, q_hat = y_hat.astype(jnp.float32), q_hat.astype(jnp.float32)
     alive = alive.astype(jnp.float32)
@@ -270,36 +261,6 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         model.init_z(bs, seq_len, rngs),
     )
 
-    if cfg.rand_n:
-        n = jax.random.randint(
-            rngs(),
-            shape=(),
-            minval=max(1, cfg.n - cfg.rand_n_width),
-            maxval=cfg.n + cfg.rand_n_width + 1,
-        )
-    else:
-        n = cfg.n
-
-    if cfg.rand_T:
-        T = jax.random.randint(
-            rngs(),
-            shape=(),
-            minval=max(1, cfg.T - cfg.rand_T_width),
-            maxval=cfg.T + cfg.rand_T_width + 1,
-        )
-    else:
-        T = cfg.T
-
-    if cfg.rand_N_sup:
-        rand_n_sup = jax.random.randint(
-            rngs(),
-            shape=(),
-            minval=max(1, cfg.N_sup - cfg.rand_N_sup_width),
-            maxval=cfg.N_sup + cfg.rand_N_sup_width + 1,
-        )
-    else:
-        rand_n_sup = cfg.N_sup
-
     min_steps = (
         jax.random.uniform(rngs(), (bs, 1)) <= cfg.halt_exploration_prob
     ) * jax.random.randint(rngs(), (bs, 1), 2, cfg.N_sup + 1)
@@ -308,31 +269,10 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
         step, model, opt, y_in, z_in, alive, rngs = carry
 
         # update step
-        step_T = jnp.where(cfg.warmup_T & (step == 1), 1, T)
         (loss, (y, z, y_hat, q_hat)), grads = grad_fn(
-            model, x, y_in, z_in, y_true, alive, cfg, step_T, n
+            model, x, y_in, z_in, y_true, alive, cfg, cfg.T, cfg.n
         )
-        scaled_grads = jax.tree.map(lambda g: g * (step <= rand_n_sup), grads)
-        opt.update(model, scaled_grads)
-
-        if cfg.stay_on_policy:
-            n_max = cfg.n + cfg.rand_n_width if cfg.rand_n else None
-            (y, z), _, _ = model(x=x, y=y_in, z=z_in, n=n, T=T, n_max=n_max)
-
-        # add noise to latents (new) TODO mess with std shape
-        corr_std = (
-            (jax.random.uniform(rngs(), (bs, 1, 1)) >= cfg.corruption_clean_prop)
-            * jax.random.uniform(rngs(), (bs, 1, 1))
-            * cfg.max_corruption_std
-        )
-        y = (
-            y
-            + jax.random.normal(rngs(), y.shape) * y.std((-1), keepdims=True) * corr_std
-        )
-        z = (
-            z
-            + jax.random.normal(rngs(), z.shape) * z.std((-1), keepdims=True) * corr_std
-        )
+        opt.update(model, grads)
 
         keep_alive = q_hat < 0.0
         alive = alive & (keep_alive | (step < min_steps))
@@ -379,7 +319,6 @@ def train_step(model, ema_model, opt, batch, cfg, rngs):
 @nnx.jit(static_argnames=("cfg",))
 def eval_step(model, batch, cfg, rngs):
     x_input, y_true = batch["inputs"], batch["labels"]
-    keys = jax.random.split(rngs(), cfg.test_k)
 
     def one_pred(key):
         run_rngs = nnx.Rngs(key)
@@ -392,8 +331,9 @@ def eval_step(model, batch, cfg, rngs):
         )
         return y_hats.argmax(axis=-1), q_hats
 
-    train_N = cfg.N_sup if cfg.N_sup_test > cfg.N_sup else None
+    keys = jax.random.split(rngs(), cfg.test_k)
     k_preds, q_hats = jax.vmap(one_pred)(keys)
+    train_N = cfg.N_sup if cfg.N_sup_test > cfg.N_sup else None
 
     preds = k_preds[0]
     scalars, cell_acc, solved_acc = pred_metrics(
@@ -408,7 +348,7 @@ def eval_step(model, batch, cfg, rngs):
         )
         mode_preds = jnp.argmax(
             jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1
-        )
+        )  # TODO change to puzzle-wide mode
         conf_scalars, conf_cell_acc, conf_solved_acc = pred_metrics(
             conf_preds, y_true, prefix="eval_conf", train_N=train_N, return_curves=True
         )
@@ -441,55 +381,6 @@ def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, prefix="val"):
     return renamed, curves
 
 
-@nnx.jit(static_argnames=("cfg",))
-def asymptotic_alignment_score(model, batch, cfg, rngs):
-    """arxiv:2211.09961"""
-    y_hats1, _, (y1, z1) = model.predict(
-        batch["inputs"], N_sup=cfg.N_sup_test, n=cfg.n, T=cfg.T, rngs=rngs
-    )
-
-    y1_s, z1_s = jnp.roll(y1, shift=1, axis=0), jnp.roll(z1, shift=1, axis=0)
-
-    y_hats2, _, (y2, z2) = model.predict(
-        batch["inputs"],
-        y=y1_s,
-        z=z1_s,
-        N_sup=cfg.N_sup_test,
-        n=cfg.n,
-        T=cfg.T,
-        rngs=rngs,
-    )
-
-    def cos_sim(a, b):
-        a, b = rearrange(a, "b ... -> b (...)"), rearrange(b, "b ... -> b (...)")
-        return (a * b).sum(-1) / (
-            jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1)
-        ).clip(min=1e-8)
-
-    # curve over inference depth: (N_sup_test,)
-    pred_match_curve = (y_hats1.argmax(axis=-1) == y_hats2.argmax(axis=-1)).mean(
-        axis=(-1, -2)
-    )
-
-    return {
-        "scalars": {
-            "asymp_align/pred_match": pred_match_curve[-1],
-            "asymp_align/y_cos_sim": cos_sim(y1, y2).mean(),
-            "asymp_align/z_cos_sim": cos_sim(z1, z2).mean(),
-        },
-        "curves": {"aa_pred_match": pred_match_curve},
-    }
-
-
-def run_aa_epoch(model, data_iter, cfg, rngs, mesh=None):
-    model.eval()
-    return calc_metric_over_batches(
-        lambda batch: asymptotic_alignment_score(model, batch, cfg, rngs),
-        data_iter,
-        mesh,
-    )
-
-
 def model_factory(cfg, param_dtype, compute_dtype, rngs):
     Linear = partial(
         nnx.Linear, dtype=compute_dtype, param_dtype=param_dtype, rngs=rngs
@@ -513,10 +404,18 @@ def model_factory(cfg, param_dtype, compute_dtype, rngs):
             cfg.vocab_size, cfg.h_dim, param_dtype=param_dtype, rngs=rngs
         ),
         init_y=InitState(
-            cfg.init_state, cfg.h_dim, rngs=rngs, noise_prop=cfg.init_noise_prop, noise_std=cfg.init_noise_std
+            cfg.init_state,
+            cfg.h_dim,
+            rngs=rngs,
+            noise_prop=cfg.init_noise_prop,
+            noise_std=cfg.init_noise_std,
         ),
         init_z=InitState(
-            cfg.init_state, cfg.h_dim, rngs=rngs, noise_prop=cfg.init_noise_prop, noise_std=cfg.init_noise_std
+            cfg.init_state,
+            cfg.h_dim,
+            rngs=rngs,
+            noise_prop=cfg.init_noise_prop,
+            noise_std=cfg.init_noise_std,
         ),
     )
 
@@ -544,19 +443,9 @@ class cfg:
     N_sup: int = 16
     n: int = 6
     T: int = 3
-    rand_n: bool = False
-    rand_n_width: int = 2  # half-width of support for rand_n
-    rand_T: bool = False
-    rand_T_width: int = 1  # half-width of support for rand_T
-    rand_N_sup: bool = False
-    rand_N_sup_width: int = 1  # half-width of support for rand_N_sup
-    warmup_T: bool = False  # use T=1 for the first supervision step
 
     halt_loss_weight: float = 0.5
     halt_exploration_prob: float = 0.1
-    max_corruption_std: float = 0.0
-    corruption_clean_prop: float = 0.5
-    stay_on_policy: bool = False
 
     batch_size: int = 768
     lr: float = 1e-4
@@ -695,14 +584,9 @@ if __name__ == "__main__":
             scalars, curves = evaluate_epoch(
                 ema_model, test_loader, cfg, rngs, mesh, prefix="test"
             )
-            aa_scalars, aa_curves = run_aa_epoch(
-                ema_model, test_loader, cfg, rngs, mesh
-            )
 
-            writer.write_scalars(0, {**scalars, **aa_scalars})
-
-            all_curves = {**curves, **aa_curves}
-            for name, curve in all_curves.items():
+            writer.write_scalars(0, scalars)
+            for name, curve in curves.items():
                 for i, v in enumerate(curve):
                     writer.write_scalars(i + 1, {f"test_curve/{name}": float(v)})
 
