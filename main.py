@@ -76,7 +76,9 @@ class TRM(nnx.Module):
         y, z = self.latent_recursion(x=x, y=y, z=z, n=n)
         return (y, z), self.output_head(y), self.Q_head(y)
 
-    def predict(self, x_input, y=None, z=None, N_sup=16, n=6, T=3, rngs=None):
+    def predict(
+        self, x_input, y=None, z=None, N_sup=16, n=6, T=3, z_noise_std=0.0, rngs=None
+    ):
         x = self.input_embedding(x_input)
         batch_size, seq_len, _ = x.shape
 
@@ -86,13 +88,17 @@ class TRM(nnx.Module):
                 self.init_z(batch_size, seq_len, rngs),
             )
 
-        def supervision_step(carry, _):
+        def supervision_step(carry, key):
             y, z = carry
+
+            eps = jax.random.normal(key, z.shape)
+            z = z + eps * z.std(-1, keepdims=True) * z_noise_std
+
             (y, z), y_hat, q_hat = self(x=x, y=y, z=z, n=n, T=T)
             return (y, z), (y_hat, q_hat)
 
         (ys, zs), (y_hats, q_hats) = lax.scan(
-            supervision_step, (y, z), None, length=N_sup
+            supervision_step, (y, z), jax.random.split(rngs.next(), N_sup), length=N_sup
         )
         return y_hats, q_hats, (ys, zs)
 
@@ -327,6 +333,7 @@ def eval_step(model, batch, cfg, rngs):
             N_sup=cfg.N_sup_test,
             n=cfg.n,
             T=cfg.T,
+            z_noise_std=cfg.z_noise_std,
             rngs=run_rngs,
         )
         return y_hats.argmax(axis=-1), q_hats
@@ -441,6 +448,7 @@ class cfg:
     init_state: str = "static"
     init_noise_prop: float = 0.5  # prop of entries noised in "noisy_static" mode
     init_noise_std: float = 0.1  # noise std as multiple of init scale (sqrt(1/h_dim))
+    z_noise_std: float = 0.0
 
     N_sup: int = 16
     n: int = 6
