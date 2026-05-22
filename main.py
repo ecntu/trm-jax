@@ -346,9 +346,11 @@ def eval_step(model, batch, cfg, rngs):
             jnp.take_along_axis(k_preds, q_hats.argmax(axis=0, keepdims=True), axis=0),
             "1 n b l -> n b l",
         )
-        mode_preds = jnp.argmax(
-            jax.nn.one_hot(k_preds, cfg.vocab_size).sum(axis=0), axis=-1
-        )  # TODO change to puzzle-wide mode
+
+        vote_counts = (k_preds[:, None] == k_preds[None, :]).all(-1).sum(0)
+        best_k = vote_counts.argmax(0)
+        mode_preds = jnp.take_along_axis(k_preds, best_k[None, ..., None], axis=0)[0]
+
         conf_scalars, conf_cell_acc, conf_solved_acc = pred_metrics(
             conf_preds, y_true, prefix="eval_conf", train_N=train_N, return_curves=True
         )
