@@ -35,13 +35,18 @@ for seed in {1..5}; do
 
         ks=(1)
         [[ "$init_state" == "random" ]] && ks=(1 3 5 7)
+        z_noise_stds=(0.0 0.1 0.5 1.0)
         for k in "${ks[@]}"; do
-            echo "Testing with init_state=${init_state}, seed=${seed}, k=${k}, size=${SIZE}"
-            uv run --with jax[tpu] main.py \
-                --init_state $init_state --test_k $k --seed $seed \
-                --test_only --test_size 10_000 --N_sup_test $N_SUP_TEST \
-                --workdir $WORKDIR \
-                --logdir ${WORKDIR}/test_k${k} $EXTRA_ARGS
+            for z_noise_std in "${z_noise_stds[@]}"; do
+                [[ "$k" == "1" && "$z_noise_std" != "0.0" ]] && continue
+                echo "Testing with init_state=${init_state}, seed=${seed}, k=${k}, z_noise_std=${z_noise_std}, size=${SIZE}"
+                uv run --with jax[tpu] main.py \
+                    --init_state $init_state --test_k $k --seed $seed \
+                    --z_noise_std $z_noise_std \
+                    --test_only --test_size 10_000 --N_sup_test $N_SUP_TEST \
+                    --workdir $WORKDIR \
+                    --logdir ${WORKDIR}/test_k${k}_znoise${z_noise_std//./_} $EXTRA_ARGS
+            done
         done
         touch "${WORKDIR}/TESTED"
 
