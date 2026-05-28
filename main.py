@@ -390,27 +390,27 @@ def evaluate_epoch(model, data_iter, cfg, rngs, mesh=None, prefix="val"):
     return renamed, curves
 
 
-def model_factory(cfg, param_dtype, compute_dtype, rngs):
+def model_factory(cfg, seq_len, vocab_size, param_dtype, compute_dtype, rngs):
     Linear = partial(
         nnx.Linear, dtype=compute_dtype, param_dtype=param_dtype, rngs=rngs
     )
 
     model = TRM(
         net=Net(
-            cfg.seq_len,
+            seq_len,
             cfg.h_dim,
             expansion=cfg.mlp_factor,
             n_layers=cfg.n_layers,
             linear=Linear,
             rngs=rngs,
         ),
-        output_head=Linear(cfg.h_dim, cfg.vocab_size),
+        output_head=Linear(cfg.h_dim, vocab_size),
         Q_head=nnx.Sequential(
             partial(reduce, pattern="b l h -> b h", reduction="mean"),
             Linear(cfg.h_dim, 1),
         ),
         input_embedding=nnx.Embed(
-            cfg.vocab_size, cfg.h_dim, param_dtype=param_dtype, rngs=rngs
+            vocab_size, cfg.h_dim, param_dtype=param_dtype, rngs=rngs
         ),
         init_y=InitState(
             cfg.init_state,
@@ -439,8 +439,6 @@ def model_factory(cfg, param_dtype, compute_dtype, rngs):
 @dataclass(frozen=True)
 class cfg:
     dataset: str = "emiliocantuc/sudoku-extreme-1k-aug-1000"
-    seq_len: int = 81
-    vocab_size: int = 10
 
     n_layers: int = 2
     h_dim: int = 512
@@ -509,6 +507,9 @@ if __name__ == "__main__":
     logging.info(f"Using mesh: {mesh}")
 
     ds = load_dataset(cfg.dataset)
+    seq_len = ds["train"].features["inputs"].length
+    vocab_size = ds["train"].features["labels"].feature.num_classes
+
     val_test = ds["test"].train_test_split(train_size=cfg.val_size, seed=cfg.data_seed)
     train_ds, val_ds, test_ds = ds["train"], val_test["train"], val_test["test"]
     if cfg.test_size is not None:
@@ -519,7 +520,9 @@ if __name__ == "__main__":
     test_loader = Loader(test_ds, batch_size=cfg.batch_size, epochs=1)
 
     with jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext():
-        model, decay_mask = model_factory(cfg, param_dtype, compute_dtype, rngs)
+        model, decay_mask = model_factory(
+            cfg, seq_len, vocab_size, param_dtype, compute_dtype, rngs
+        )
         n_params = sum(
             jax.tree.map(jnp.size, jax.tree.leaves(nnx.state(model, nnx.Param)))
         )
